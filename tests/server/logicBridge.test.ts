@@ -246,3 +246,29 @@ it('retains unknown backend occupancy across service restart', async () => {
   const blocked = await api(second, context.executor.token, '/jobs', { ...context.parameters, clientRequestId: 'after-restart' });
   expect(await json(blocked)).toMatchObject({ error: { code: 'BACKEND_OUTCOME_UNKNOWN' } });
 });
+
+it.each(['', ' \t\n', ' '.repeat(4096)])('defaults a blank prompt at the HTTP job boundary (%s)', async prompt => {
+  const service = await fixture(); const context = await bound(service);
+  const response = await api(service, context.executor.token, '/jobs', { ...context.parameters, prompt });
+  expect(response.status).toBe(202);
+  expect(await json(response)).toMatchObject({ prompt: 'Add an instrumental layer' });
+});
+
+it.each([42, {}, ' '.repeat(4097)])('rejects an invalid prompt without normalizing away validation (%j)', async prompt => {
+  const service = await fixture(); const context = await bound(service);
+  const response = await api(service, context.executor.token, '/jobs', { ...context.parameters, prompt });
+  expect(response.status).toBe(400);
+  expect(await json(response)).toMatchObject({ error: { code: 'INVALID_FIELD' } });
+});
+
+it('rejects no-submission acknowledgments from non-executors or after a task receipt', async () => {
+  const service = await fixture(); const context = await bound(service);
+  const job = await json(await api(service, context.executor.token, '/jobs', context.parameters));
+  const path = `/jobs/${job.jobId}`;
+  await api(service, context.executor.token, `${path}/transition`, { state: 'dispatched' });
+  expect((await api(service, context.token, `${path}/reconcile`, { submissionNotStarted: true })).status).toBe(403);
+  expect((await api(service, context.executor.token, `${path}/submission`, { backendTaskId: 'accepted-task' })).status).toBe(200);
+  expect((await api(service, context.executor.token, `${path}/reconcile`, { submissionNotStarted: true })).status).toBe(409);
+  expect(await json(await api(service, context.executor.token, path))).toMatchObject({ state: 'running', backendOccupancy: 'occupied', backendTaskId: 'accepted-task' });
+  expect((await api(service, context.executor.token, '/jobs', { ...context.parameters, clientRequestId: 'blocked' })).status).toBe(409);
+});

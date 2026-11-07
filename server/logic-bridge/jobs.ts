@@ -25,7 +25,10 @@ export function binding(data: Record<string, unknown>, state: BridgeState): Cont
   return proposed;
 }
 export function createJob(data: Record<string, unknown>, state: BridgeState, executor: Executor | undefined): BridgeJob {
-  const proposed = { sessionId: string(data, 'sessionId'), projectId: string(data, 'projectId'), captureId: string(data, 'captureId'), bindingId: string(data, 'bindingId'), clientRequestId: string(data, 'clientRequestId'), instrument: string(data, 'instrument'), startFrame: integer(data, 'startFrame'), endFrame: integer(data, 'endFrame'), prompt: string(data, 'prompt', 'Add an instrumental layer'), modelId: string(data, 'modelId'), seed: integer(data, 'seed', -1) };
+  const rawPrompt = data.prompt ?? 'Add an instrumental layer';
+  check(typeof rawPrompt === 'string' && rawPrompt.length <= 4096, 'INVALID_FIELD', 'Invalid prompt');
+  const prompt = rawPrompt.trim() ? rawPrompt : 'Add an instrumental layer';
+  const proposed = { sessionId: string(data, 'sessionId'), projectId: string(data, 'projectId'), captureId: string(data, 'captureId'), bindingId: string(data, 'bindingId'), clientRequestId: string(data, 'clientRequestId'), instrument: string(data, 'instrument'), startFrame: integer(data, 'startFrame'), endFrame: integer(data, 'endFrame'), prompt, modelId: string(data, 'modelId'), seed: integer(data, 'seed', -1) };
   const parameterHash = hash(JSON.stringify(proposed));
   const previous = state.jobs.find(job => job.sessionId === proposed.sessionId && job.clientRequestId === proposed.clientRequestId);
   if (previous) { check(previous.parameterHash === parameterHash, 'REQUEST_CONFLICT', 'Conflicting job retry', 409); return previous; }

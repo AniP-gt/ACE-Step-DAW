@@ -68,8 +68,8 @@ export async function runBridgeJob(job: BridgeObject, disconnectSignal: AbortSig
     const endFrame = numberField(job, 'endFrame');
     const clip = store.addClip(track.id, { startTime: startFrame / 48000, duration: (endFrame - startFrame) / 48000, prompt: stringField(job, 'prompt'), lyrics: '' });
     clipId = clip.id;
-    submissionStarted = true;
     const result = await generateFromExplicitContext({
+      onSubmissionStarted: () => { submissionStarted = true; },
       bridgeJobId: jobId,
       sourceTiming: readLogicSourceTiming(capture),
       projectId, clipId, canonicalBlob: blob,
@@ -109,7 +109,10 @@ export async function runBridgeJob(job: BridgeObject, disconnectSignal: AbortSig
       const uncertain = submissionStarted && !submissionAcknowledged;
       current = await bridgeJson(token, `${path}/transition`, { state: uncertain ? 'interrupted' : 'failed', error: uncertain ? `SUBMISSION_OUTCOME_UNKNOWN: ${message}` : message });
     }
-    if (submissionStarted) await reconcileBridgeJob(current, token);
+    if (!submissionStarted && !submittedTaskId && current.backendOccupancy !== 'released') {
+      current = await bridgeJson(token, `${path}/reconcile`, { submissionNotStarted: true });
+    }
+    await reconcileBridgeJob(current, token);
   } finally {
     clearInterval(cancellationTimer);
     disconnectSignal.removeEventListener('abort', disconnect);

@@ -136,7 +136,11 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
         updated = { ...job, backendTaskId, state: job.state === 'dispatched' ? 'running' : job.state, backendOccupancy: ['canceled', 'interrupted'].includes(job.state) ? 'unknown' : 'occupied' };
       }
       else if (method === 'POST' && action === 'reconcile') {
-        if (data.backendStopped === true) check(credential === 'control', 'FORBIDDEN', 'Control verification of backend shutdown required', 403);
+        if (data.submissionNotStarted === true) {
+          scope(job.sessionId, 'executor', job.projectId); liveExecutor(job.sessionId);
+          check(!job.backendTaskId && ['queued', 'dispatched', 'failed', 'interrupted', 'canceled'].includes(job.state), 'INVALID_TRANSITION', 'Submitted jobs require a terminal backend outcome', 409);
+        }
+        else if (data.backendStopped === true) check(credential === 'control', 'FORBIDDEN', 'Control verification of backend shutdown required', 403);
         else {
           scope(job.sessionId, 'executor', job.projectId); liveExecutor(job.sessionId);
           check(job.backendTaskId && data.backendTaskId === job.backendTaskId, 'TASK_CONFLICT', 'Exact persisted backend task ID required', 409);
