@@ -28,6 +28,7 @@
     "dashboard:build": "vite build --config dashboard/vite.config.ts"
   },
   "dependencies": {
+    "@alexanderolsen/libsamplerate-js": "2.1.2",
     "@breezystack/lamejs": "^1.2.7",
     "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-javascript": "^6.2.5",

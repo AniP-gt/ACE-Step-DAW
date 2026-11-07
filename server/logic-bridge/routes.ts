@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { BridgeCredential, BridgeRole } from '../../shared/logic-bridge/types';
 import type { storage } from './storage';
 import { check, object, string } from './validation';
-import { appendChunk, createCapture, finalize } from './captures';
+import { appendChunk, createCapture, finalize, reservedCaptureBytes } from './captures';
 import { binding, createJob, transition, backendOccupancy, type Executor } from './jobs';
 import { hash, validateResult } from './audio';
 export interface RouteRequest {
@@ -76,7 +76,11 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
     if (resource === 'captures' && id) {
       const capture = db.state.captures.find(item => item.captureId === id); check(capture, 'NOT_FOUND', 'Capture missing', 404); scope(capture.sessionId, 'native');
       let updated = capture;
-      if (method === 'PUT' && action === 'chunks') updated = await appendChunk(root, capture, { sequence: Number(sequence), startFrame: Number(headers['x-start-frame']), sha256: String(headers['x-chunk-sha256'] ?? ''), bytes });
+      if (method === 'PUT' && action === 'chunks') {
+        const startFrame = headers['x-start-frame'];
+        check(typeof startFrame === 'string' && /^\d+$/.test(startFrame) && Number.isSafeInteger(Number(startFrame)), 'INVALID_CHUNK', 'X-Start-Frame must be a nonnegative integer');
+        updated = await appendChunk(root, capture, { sequence: Number(sequence), startFrame: Number(startFrame), sha256: String(headers['x-chunk-sha256'] ?? ''), bytes });
+      }
       else if (method === 'POST' && action === 'finalize') {
         const sha256 = string(data, 'sha256');
         if (capture.state === 'ready') check(capture.originalPcmSha256 === sha256, 'HASH_MISMATCH', 'Conflicting finalization retry', 409);
@@ -144,7 +148,7 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
       else if (method === 'POST' && action === 'result') {
         scope(job.sessionId, 'executor', job.projectId); liveExecutor(job.sessionId); check(job.state === 'exporting', 'INVALID_TRANSITION', 'Job is not exporting', 409);
         validateResult(bytes, job.endFrame - job.startFrame);
-        check(db.state.assets.reduce((sum, asset) => sum + asset.size, 0) + bytes.length <= quota, 'QUOTA_EXCEEDED', 'Result quota exceeded', 413);
+        check(db.state.assets.reduce((sum, asset) => sum + asset.size, 0) + reservedCaptureBytes(db.state) + bytes.length <= quota, 'QUOTA_EXCEEDED', 'Result quota exceeded', 413);
         const capture = db.state.captures.find(item => item.captureId === job.captureId); check(capture, 'SOURCE_UNAVAILABLE', 'Source missing', 409);
         const assetId = randomUUID(); const resultId = randomUUID(); const sha256 = hash(bytes);
         await writeFile(join(root, 'assets', assetId), bytes, { mode: 0o600 });

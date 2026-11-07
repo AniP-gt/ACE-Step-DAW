@@ -5,14 +5,19 @@ import type { BridgeCapture } from '../../shared/logic-bridge/types';
 import type { BridgeState } from './storage';
 import { canonicalize, hash, wav } from './audio';
 import { check, integer, number, string } from './validation';
+function captureBytes(frames: number, rate: number, channels: number): number {
+  return frames * channels * 4 + Math.round(frames * 48000 / rate) * 8 + 88;
+}
+export function reservedCaptureBytes(state: BridgeState): number {
+  return state.captures.filter(capture => capture.state === 'receiving').reduce((sum, capture) => sum + captureBytes(capture.expectedFrames, capture.sampleRate, capture.channels), 0);
+}
 export function createCapture(data: Record<string, unknown>, state: BridgeState, quota: number): BridgeCapture {
   const sampleRate = integer(data, 'sampleRate');
   const channels = integer(data, 'channels');
   const expectedFrames = integer(data, 'expectedFrames');
   check([44100, 48000, 88200, 96000].includes(sampleRate) && [1, 2].includes(channels), 'UNSUPPORTED_FORMAT', 'Unsupported rate or layout');
   check(expectedFrames >= sampleRate && expectedFrames <= sampleRate * 120, 'INVALID_DURATION', 'Capture must be 1 to 120 seconds');
-  const reserved = state.captures.filter(capture => capture.state === 'receiving').reduce((sum, capture) => sum + capture.expectedFrames * (capture.channels * 4 + 8 * 48000 / capture.sampleRate) + 88, 0);
-  check(state.assets.reduce((sum, asset) => sum + asset.size, 0) + reserved + expectedFrames * (channels * 4 + 8 * 48000 / sampleRate) + 88 <= quota, 'QUOTA_EXCEEDED', 'Insufficient bridge quota', 413);
+  check(state.assets.reduce((sum, asset) => sum + asset.size, 0) + reservedCaptureBytes(state) + captureBytes(expectedFrames, sampleRate, channels) <= quota, 'QUOTA_EXCEEDED', 'Insufficient bridge quota', 413);
   const meter = data.timeSignature;
   check(Array.isArray(meter) && meter.length === 2 && meter.every(value => Number.isSafeInteger(value) && value > 0), 'INVALID_METER', 'Invalid timeSignature');
   const tempo = number(data, 'tempo');
@@ -39,7 +44,7 @@ export async function finalize(root: string, capture: BridgeCapture, sha256: str
   check(capture.state === 'receiving' && capture.receivedFrames === capture.expectedFrames, 'INCOMPLETE_CAPTURE', 'Capture is incomplete', 409);
   const pcm = await readFile(join(root, 'staging', capture.captureId));
   check(hash(pcm) === sha256, 'HASH_MISMATCH', 'Stream checksum mismatch');
-  const canonical = canonicalize(pcm, capture.sampleRate, capture.channels);
+  const canonical = await canonicalize(pcm, capture.sampleRate, capture.channels);
   const original = wav(pcm, capture.sampleRate, capture.channels);
   const originalAssetId = randomUUID();
   const canonicalAssetId = randomUUID();
