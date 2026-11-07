@@ -14,8 +14,14 @@ import { dismissWelcomeOverlay } from '../support/e2eStartup';
 
 test.describe('Generation Panel @critical', () => {
   test.beforeEach(async ({ page }) => {
+    await page.route('**/api/health', (route) => route.fulfill({ json: { status: 'ok' } }));
+    await page.route('**/api/v1/model_inventory', (route) => route.fulfill({
+      json: { data: { models: [{ name: 'acestep-v15-turbo', is_loaded: true, is_default: true }], lm_models: [] } },
+    }));
     await dismissWelcomeOverlay(page);
+    const inventoryLoaded = page.waitForResponse('**/api/v1/model_inventory');
     await page.goto('/');
+    await inventoryLoaded;
     await page.waitForLoadState('domcontentloaded');
     await page.waitForFunction(() => typeof (window as any).__store !== 'undefined');
     await page.evaluate(() => {
@@ -39,76 +45,48 @@ test.describe('Generation Panel @critical', () => {
     });
   });
 
-  test('submits the visible generation controls through the shared store payload', async ({ page }) => {
-    await expect(page.getByRole('complementary', { name: 'AI generation panel' })).toBeVisible();
+  test('submits the visible custom generation controls through the shared pipeline', async ({ page }, testInfo) => {
+    await page.route('**/api/release_task', (route) => route.fulfill({
+      json: { data: { task_id: 'generation-panel-task', status: 'queued' } },
+    }));
+    await page.route('**/api/query_result', (route) => route.fulfill({
+      json: { data: [{ task_id: 'generation-panel-task', status: 0, result: '[]' }] },
+    }));
 
-    await page.getByRole('textbox', { name: 'Generation prompt' }).fill('glassy future garage with vocal chops');
-    await page.getByTestId('generation-style-tags').getByRole('button', { name: 'Electronic' }).click();
-    await page.getByRole('combobox', { name: 'Generation key' }).selectOption('G minor');
-    await page.getByRole('spinbutton', { name: 'Generation BPM' }).fill('140');
-    await page.getByRole('spinbutton', { name: 'Generation length' }).fill('48');
-    await page.getByTestId('generation-temperature-slider').focus();
-    for (let index = 0; index < 5; index += 1) {
-      await page.keyboard.press('ArrowLeft');
-    }
-    await page.getByRole('combobox', { name: 'Generation variation count' }).selectOption('4');
-    await page.getByTestId('generation-generate-btn').click();
+    await expect(page.getByLabel('Generate panel', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Custom', exact: true }).click();
+    const form = page.getByTestId('full-song-form');
+    await form.getByRole('combobox', { name: 'Generation prompt' }).fill('glassy future garage with vocal chops');
+    await form.getByRole('button', { name: 'Add house style tag', exact: true }).click();
+    await form.getByRole('checkbox', { name: 'Auto', exact: true }).uncheck();
+    await form.getByRole('spinbutton').first().fill('48');
+    await form.getByRole('slider', { name: 'Generation temperature' }).fill('0.4');
+    await form.getByRole('checkbox', { name: 'Rand', exact: true }).uncheck();
+    await form.getByRole('spinbutton').nth(1).fill('1234');
+    await form.getByRole('checkbox', { name: /Match project/ }).check();
+    await form.getByRole('checkbox', { name: 'Instrumental', exact: true }).check();
+    await form.getByRole('checkbox', { name: 'Split to stems', exact: true }).uncheck();
 
-    const state = await page.evaluate(() => {
-      const browserWindow = window as unknown as {
-        __store: {
-          getState: () => {
-            generationForm: {
-              prompt: string;
-              styleTags: string[];
-              bpm: number;
-              keyScale: string;
-              lengthSeconds: number;
-              temperature: number;
-              variationCount: number;
-            };
-            lastSubmittedRequest: {
-              prompt: string;
-              styleTags: string[];
-              bpm: number;
-              keyScale: string;
-              duration: number;
-              temperature: number;
-              variationCount: number;
-            } | null;
-            variationSession: {
-              variations: Array<unknown>;
-            } | null;
-          };
-        };
-      };
-
-      const dawState = browserWindow.__store.getState();
-      return {
-        generationForm: dawState.generationForm,
-        lastSubmittedRequest: dawState.lastSubmittedRequest,
-        variationCount: dawState.variationSession?.variations.length ?? 0,
-      };
+    const requestPromise = page.waitForRequest('**/api/release_task');
+    await page.getByRole('button', { name: 'Generate Full Song', exact: true }).click();
+    const request = await requestPromise;
+    const body = request.postDataBuffer();
+    expect(body).not.toBeNull();
+    const payload = await new Response(new Uint8Array(body ?? []), {
+      headers: { 'content-type': request.headers()['content-type'] },
+    }).formData();
+    const fields = Object.fromEntries([...payload.entries()].filter(([, value]) => typeof value === 'string'));
+    await testInfo.attach('submitted-generation-payload', {
+      body: JSON.stringify(fields, null, 2), contentType: 'application/json',
     });
-
-    expect(state.generationForm).toMatchObject({
-      prompt: 'glassy future garage with vocal chops',
-      styleTags: ['Electronic'],
-      bpm: 140,
-      keyScale: 'G minor',
-      lengthSeconds: 48,
-      temperature: 0.45,
-      variationCount: 4,
+    expect(fields).toMatchObject({
+      task_type: 'text2music',
+      prompt: 'house. glassy future garage with vocal chops',
+      lyrics: '[Instrumental]',
+      bpm: '128', key_scale: 'E minor', time_signature: '4',
+      audio_duration: '48', guidance_scale: '0.4',
+      seed: '1234', use_random_seed: 'false', batch_size: '1',
     });
-    expect(state.lastSubmittedRequest).toMatchObject({
-      prompt: 'glassy future garage with vocal chops',
-      styleTags: ['Electronic'],
-      bpm: 140,
-      keyScale: 'G minor',
-      duration: 48,
-      temperature: 0.45,
-      variationCount: 4,
-    });
-    expect(state.variationCount).toBe(4);
+    await expect(page.getByLabel('Generate panel', { exact: true })).toBeHidden();
   });
 });
