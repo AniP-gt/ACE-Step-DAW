@@ -12,13 +12,14 @@ void bridgeProbeCommand(juce::AudioProcessor&,const juce::String&,const juce::St
 juce::String bridgeProbeStatus(juce::AudioProcessor&);
 juce::File bridgeProbeResult(juce::AudioProcessor&);
 unsigned bridgeProbeNetworkRequests(juce::AudioProcessor&);
-static bool restoreCache(const juce::File& file,const juce::String& resultId,bool expectReady,const juce::String& overrideName={}) {
+juce::String bridgeProbePlacement(juce::AudioProcessor&);
+static bool restoreCache(const juce::File& file,const juce::String& resultId,bool expectReady,const juce::String& overrideName={},const juce::String& expectedPlacement="Suggested start: +0.000000 s") {
  auto* settings=new juce::DynamicObject();settings->setProperty("stateId","offline-fixture");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",resultId);settings->setProperty("cachedFilename",overrideName.isEmpty()?file.getFileName():overrideName);
  juce::MemoryBlock state;{juce::MemoryOutputStream stream(state,false);stream.writeString(juce::JSON::toString(juce::var(settings)));}
  std::unique_ptr<juce::AudioProcessor> restored(createPluginFilter());restored->setStateInformation(state.getData(),static_cast<int>(state.getSize()));
  for(int i=0;i<500;++i){auto status=bridgeProbeStatus(*restored);if(status.startsWith("Result ready:") || status.startsWith("Cache unavailable:"))break;juce::Thread::sleep(10);}
  auto status=bridgeProbeStatus(*restored);bool valid=expectReady?status.startsWith("Result ready:"):status.startsWith("Cache unavailable:");
- valid=valid && bridgeProbeNetworkRequests(*restored)==0 && (expectReady?bridgeProbeResult(*restored)==file:bridgeProbeResult(*restored)==juce::File());
+ valid=valid && (expectReady?bridgeProbePlacement(*restored)==expectedPlacement:bridgeProbePlacement(*restored).isEmpty()) && bridgeProbeNetworkRequests(*restored)==0 && (expectReady?bridgeProbeResult(*restored)==file:bridgeProbeResult(*restored)==juce::File());
  restored->prepareToPlay(48000,32);juce::AudioBuffer<float> audio(2,32);juce::MidiBuffer midi;for(int c=0;c<2;++c)for(int i=0;i<32;++i)audio.setSample(c,i,.25f);restored->processBlock(audio,midi);for(int c=0;c<2;++c)for(int i=0;i<32;++i)valid=valid && audio.getSample(c,i)==.25f;restored->releaseResources();
  if(!valid)std::cerr<<"Offline restore unexpected status: "<<status<<"\n";
  return valid;
@@ -27,13 +28,18 @@ static bool offlineCacheChecks() {
  auto directory=juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("ACE-Step Bridge/native-results");directory.createDirectory();auto file=directory.getChildFile(juce::Uuid().toString()+".wav");auto sidecar=file.withFileExtension("json");
  struct Cleanup {juce::File file,sidecar;~Cleanup(){file.deleteFile();sidecar.deleteFile();}} cleanup{file,sidecar};
  juce::WavAudioFormat format;auto output=file.createOutputStream();auto writer=std::unique_ptr<juce::AudioFormatWriter>(format.createWriterFor(output.release(),48000,2,32,{},0));if(!writer)return false;juce::AudioBuffer<float> audio(2,128);audio.clear();audio.setSample(0,17,.5f);audio.setSample(1,17,.5f);if(!writer->writeFromAudioSampleBuffer(audio,0,128))return false;writer.reset();
- auto* metadata=new juce::DynamicObject();auto id=juce::Uuid().toString();metadata->setProperty("resultId",id);metadata->setProperty("frameCount",128);metadata->setProperty("sha256",juce::SHA256(file).toHexString());juce::var data(metadata);sidecar.replaceWithText(juce::JSON::toString(data));
+ auto* metadata=new juce::DynamicObject();auto id=juce::Uuid().toString();metadata->setProperty("resultId",id);metadata->setProperty("placementSeconds",0.0);metadata->setProperty("frameCount",128);metadata->setProperty("sha256",juce::SHA256(file).toHexString());juce::var data(metadata);sidecar.replaceWithText(juce::JSON::toString(data));
  if(!restoreCache(file,id,true))return false;
+ metadata->removeProperty("placementSeconds");sidecar.replaceWithText(juce::JSON::toString(data));if(!restoreCache(file,id,false))return false;
+ metadata->setProperty("placementSeconds","0");sidecar.replaceWithText(juce::JSON::toString(data));if(!restoreCache(file,id,false))return false;
+ sidecar.replaceWithText("{\"resultId\":\""+id+"\",\"frameCount\":128,\"sha256\":\""+juce::SHA256(file).toHexString()+"\",\"placementSeconds\":1e999}");if(!restoreCache(file,id,false))return false;
+ metadata->setProperty("placementSeconds",-1.25);sidecar.replaceWithText(juce::JSON::toString(data));if(!restoreCache(file,id,true,{},"Suggested start: -1.250000 s"))return false;
+ metadata->setProperty("placementSeconds",0.0);sidecar.replaceWithText(juce::JSON::toString(data));
  sidecar.deleteFile();if(!restoreCache(file,id,false))return false;sidecar.replaceWithText(juce::JSON::toString(data));
  if(!restoreCache(file,"wrong-result-id",false) || !restoreCache(file,id,false,"../escape.wav") || !restoreCache(file,id,false,"..\\escape.wav"))return false;
  metadata->setProperty("frameCount",129);sidecar.replaceWithText(juce::JSON::toString(data));if(!restoreCache(file,id,false))return false;metadata->setProperty("frameCount",128);sidecar.replaceWithText(juce::JSON::toString(data));
  file.replaceWithText("corrupt fixture");if(!restoreCache(file,id,false))return false;file.deleteFile();if(!restoreCache(file,id,false))return false;
- std::cout<<"PASS offline new-processor cache restore; mismatched ID/frame count, traversal, corrupt and missing WAV rejected\n";return true;
+ std::cout<<"PASS offline new-processor cache restore; signed placement; missing/nonnumeric/nonfinite placement, mismatched ID/frame count, traversal, corrupt and missing WAV rejected\n";return true;
 }
 int main(int argc,char** argv) {
  juce::ScopedJuceInitialiser_GUI init;
@@ -41,7 +47,16 @@ int main(int argc,char** argv) {
  juce::AudioBuffer<float> audio(2,512);juce::MidiBuffer midi;
  for(int b=0;b<1000;++b) {for(int c=0;c<2;++c)for(int i=0;i<512;++i)audio.setSample(c,i,static_cast<float>((b+i+c)%101)/101.0f);juce::AudioBuffer<float> before;before.makeCopyOf(audio);p->processBlock(audio,midi);for(int c=0;c<2;++c)if(std::memcmp(audio.getReadPointer(c),before.getReadPointer(c),512*sizeof(float))!=0)return 1;head.frame+=512;}
  if(argc==3 && juce::String(argv[1])=="--snapshot") {
-  std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);editor->resized();juce::Image image(juce::Image::RGB,editor->getWidth(),editor->getHeight(),true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output{juce::File(argv[2])};if(!output.openedOk() || !juce::PNGImageFormat().writeImageToStream(image,output))return 6;
+  std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);editor->resized();juce::Image image(juce::Image::RGB,editor->getWidth(),editor->getHeight(),true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output{juce::File(argv[2])};if(!output.openedOk())return 6;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 6;
+ }
+ if(argc==4 && juce::String(argv[1])=="--snapshot-cached") {
+  const juce::File cached(argv[2]),outputDirectory(argv[3]);auto metadata=juce::JSON::parse(cached.withFileExtension("json"));
+  auto* settings=new juce::DynamicObject();settings->setProperty("stateId","placement-snapshot");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",metadata["resultId"]);settings->setProperty("cachedFilename",cached.getFileName());juce::MemoryBlock state;{juce::MemoryOutputStream stream(state,false);stream.writeString(juce::JSON::toString(juce::var(settings)));}p->setStateInformation(state.getData(),static_cast<int>(state.getSize()));
+  for(int i=0;i<500 && !bridgeProbeStatus(*p).startsWith("Result ready:");++i)juce::Thread::sleep(10);
+  if(bridgeProbeResult(*p)!=cached || bridgeProbePlacement(*p)!="Suggested start: +0.000000 s" || bridgeProbeNetworkRequests(*p)!=0)return 25;
+  outputDirectory.createDirectory();std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);
+  for(auto size:{juce::Point<int>{440,360},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output(outputDirectory.getChildFile("restored-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!output.openedOk())return 26;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 26;}
+  std::cout<<"PASS restored actual result placement: "<<bridgeProbePlacement(*p)<<"; screenshots 440x360 and 880x720; zero HTTP requests\n";
  }
  if(argc==4 && juce::String(argv[1])=="--race-restore") {
   const juce::File directory(argv[2]);const auto config=juce::JSON::parse(directory.getChildFile("config.json"));
@@ -88,7 +103,7 @@ int main(int argc,char** argv) {
   if(persistedData["cachedFilename"].toString()!=file.getFileName() || persistedData.hasProperty("token") || persistedData.hasProperty("credential"))return 15;
   std::unique_ptr<juce::AudioProcessor> reopened(createPluginFilter());reopened->setStateInformation(persisted.getData(),static_cast<int>(persisted.getSize()));
   for(int i=0;i<500 && !bridgeProbeStatus(*reopened).startsWith("Result ready:");++i)juce::Thread::sleep(10);
-  if(bridgeProbeResult(*reopened)!=file || !bridgeProbeResult(*reopened).existsAsFile() || bridgeProbeNetworkRequests(*reopened)!=0){std::cerr<<"Downloaded result offline reopen failed\n";return 16;}
+  if(bridgeProbeResult(*reopened)!=file || !bridgeProbeResult(*reopened).existsAsFile() || bridgeProbeNetworkRequests(*reopened)!=0 || bridgeProbePlacement(*reopened)!="Suggested start: +0.000000 s"){std::cerr<<"Downloaded result offline reopen failed\n";return 16;}
   std::cout<<"PASS downloaded result actual serialized-state new-processor offline reopen; zero HTTP requests; drag file exists\n";
   std::cout<<"PASS actual native worker: pairing, result HTTP download, SHA256, WAV decode, canonical format and frame count\n"
            <<"file="<<file.getFullPathName()<<"\nsha256="<<hash<<"\nframes="<<reader->lengthInSamples<<"\n";
