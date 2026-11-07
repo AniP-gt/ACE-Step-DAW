@@ -1,0 +1,35 @@
+# Logic bridge service
+
+Start with `npm run bridge` (or `npx tsx server/logic-bridge/main.ts`). Default: `http://127.0.0.1:5176/v1`. `LOGIC_BRIDGE_ROOT` overrides the owner-only data directory; `LOGIC_BRIDGE_PORT` overrides the port. The installation control secret is in `<root>/control-token`; it is never logged.
+
+All writes require `X-Bridge-Protocol: 1`. All requests except health and pairing claim require `Authorization: Bearer <credential>`. The browser Origin allowlist defaults to exactly `http://127.0.0.1:5174`; other deployments must pass explicit `origins` to `createBridgeService` or set the comma-separated `LOGIC_BRIDGE_ORIGINS` launch environment variable. Host must match the actual listener. Credentials must not be placed in URLs.
+
+## Pairing
+
+1. Control credential: `POST /sessions {name}` -> `{sessionId,name,protocolVersion}`.
+2. Control credential: `POST /pairings {sessionId,role,projectId?}` -> `{code,expiresAt}`. Roles: `native`, `executor`, `mcp`. Executor and MCP require an explicit project ID.
+3. `POST /pairings/claim {code}` -> `{token,sessionId,role,projectId?}`. Codes expire after 120 seconds, work once, and failed claims are rate limited.
+
+## Capture
+
+`POST /captures {sessionId,instanceId,label?,sampleRate,channels,expectedFrames,hostStartSample,tempo,timeSignature:[numerator,denominator]}` returns a capture. Upload interleaved little-endian float32 PCM with `PUT /captures/:captureId/chunks/:sequence` plus `X-Start-Frame` and `X-Chunk-SHA256`. Chunks are at most 1 MiB and must be contiguous; byte-identical retries are idempotent. `POST /captures/:captureId/finalize {sha256}` uses the hash of the complete raw PCM stream. Finalization returns ready capture metadata and canonical asset IDs/hashes. `POST /captures/:captureId/cancel {}` invalidates partial capture.
+
+`GET /captures?sessionId=...` returns `{captures:[...]}`. `GET /assets/:assetId` transfers authenticated WAV bytes after integrity verification. Original and canonical assets are immutable; no arbitrary caller paths are accepted. The initial resampler is deterministic linear interpolation; high-quality band-limited resampling and listening qualification remain release work.
+
+## Executor and jobs
+
+`POST /executor/register {sessionId,projectId,executorId,modelId,instruments,outputSemantics}` establishes a 30-second lease. `GET /executor/jobs?sessionId=...` renews the lease and returns `{jobs:[...]}`. One live executor per session is accepted. Executor polling, binding creation, job transitions, and result upload require `X-Executor-Id` matching the current registration and credential; poll while generation is running to renew the lease. Polling is the initial command transport; the event socket only supplies refresh notifications. An empty model ID and empty instruments allow capture browsing/attachment. Generation requires explicit `outputSemantics:"isolated-layer"`, non-Turbo model ID, and a supported instrument. This capability declaration is not evidence that a model was listened to or qualified.
+
+After importing the canonical asset into the bound DAW project, executor calls `POST /bindings {sessionId,projectId,captureId,clipId,clientRequestId}`. `GET /bindings?sessionId=...` returns `{bindings:[...]}`. The frontend must reject deleted clips/stale project state before generation. Remote MCP attachment is not dispatched by this initial service; attachment is an explicit frontend action.
+
+`POST /jobs {sessionId,projectId,captureId,bindingId,clientRequestId,instrument,startFrame,endFrame,prompt?,modelId,seed?}` returns HTTP 202 and a persisted job. Ranges use canonical 48 kHz frames. One active inference job is allowed. Equal request ID/payload returns the same job; conflicting payload returns 409.
+
+Executor calls `POST /jobs/:id/transition {state,backendTaskId?,error?}` for `dispatched`, `running`, `exporting`, `failed`, or `interrupted`. Persist the backend receipt with `POST /jobs/:id/submission {backendTaskId}`: dispatched becomes running, while a canceled/interrupted job keeps its publication state. Conflicting task IDs are rejected. `POST /jobs/:id/result` accepts a binary 44-byte-header IEEE float32 48 kHz stereo WAV containing exactly the requested range. Only successful validation/storage publishes ready. `GET /jobs/:id`, `POST /jobs/:id/cancel {}`, and `GET /results/:id` provide authoritative state. Cancellation prevents late publication but does not claim backend computation has stopped. `backendOccupancy` is tracked independently: queued work reserves capacity; dispatched work occupies it; canceled/interrupted/failed submissions retain unknown occupancy until reconciliation. A queued cancellation releases immediately. Active executor leases older than 30 seconds are expired on the next authenticated request and their jobs are durably interrupted. No interrupted job is automatically reissued; stale executor uploads fail.
+
+For a known task, the current live executor may send `POST /jobs/:id/reconcile {backendTaskId,outcome:"completed"|"failed"|"canceled"}` only after observing terminal backend status. The task ID must match the persisted receipt. For a submission with unknown task ID, an operator who has independently stopped/reset the backend may use the installation control credential with `{backendStopped:true}` on the same endpoint. Scoped clients cannot use this override. Reconciliation releases occupancy without reviving canceled/interrupted output. `BACKEND_OUTCOME_UNKNOWN` names the blocking job; executor polls include unresolved jobs. Unknown occupancy survives service restart. Export metadata gives `placementSeconds`; no automatic Logic placement occurs.
+
+## Events and recovery
+
+`WS /events` checks Host/Origin at upgrade. Within three seconds send `{token,protocolVersion:1,cursor?}` as the first message. Response `{type:"authenticated",cursor}` precedes replay. Events contain `{cursor,sessionId,type}` and require an HTTP snapshot refresh. The latest 1000 events can be replayed; invalid/expired cursors close the socket. Credentials never appear in event URLs or journal entries.
+
+State is atomically replaced in `state.json`, with an append-only event journal. Live uploads are invalidated and staging removed on restart. Active jobs become interrupted with `SUBMISSION_OUTCOME_UNKNOWN`; they are never automatically resubmitted. Ready asset hashes are checked on startup. A process lock rejects a second writer. After an ungraceful process death, confirm no service process is alive before manually removing `service.lock`. Credentials persist in the owner-only state file. No token revocation UI, asset-deletion API, backend reconciliation, remote attach commands, or automatic daemon installation is provided in this bounded implementation.

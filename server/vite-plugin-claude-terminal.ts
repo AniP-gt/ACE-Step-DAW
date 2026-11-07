@@ -115,8 +115,9 @@ function attachPty(session: SessionState, ws: WebSocket, cols: number, rows: num
     setTimeout(() => {
       if (session.ptyProc) {
         const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+        const logicEnvironment = 'mcp_servers.ace-step-daw.env_vars=["LOGIC_BRIDGE_URL","LOGIC_BRIDGE_TOKEN","LOGIC_BRIDGE_SESSION_ID","LOGIC_BRIDGE_CREDENTIAL_FILE"]';
         const command = session.provider === 'codex'
-          ? `codex -c ${quote('mcp_servers.ace-step-daw.command="npx"')} -c ${quote('mcp_servers.ace-step-daw.args=["tsx","server/mcp-server.ts"]')} -c ${quote(`mcp_servers.ace-step-daw.env.DAW_MCP_BRIDGE_URL=${JSON.stringify(session.bridgeUrl)}`)}`
+          ? `codex -c ${quote('mcp_servers.ace-step-daw.command="npx"')} -c ${quote('mcp_servers.ace-step-daw.args=["tsx","server/mcp-server.ts"]')} -c ${quote(logicEnvironment)} -c ${quote(`mcp_servers.ace-step-daw.env.DAW_MCP_BRIDGE_URL=${JSON.stringify(session.bridgeUrl)}`)}`
           : 'claude';
         session.ptyProc.write(`${command}\r`);
       }

@@ -10,6 +10,7 @@
 import { WebSocket } from 'ws';
 import { parseCommand, formatResult } from './daw-cli-format';
 import { prepareAudioImport } from './audio-import';
+import { callLogicService, isLogicServiceTool } from './logic-client';
 
 const BRIDGE_URL = process.env.DAW_MCP_BRIDGE_URL ?? 'ws://127.0.0.1:5174/ws/mcp-bridge';
 const TIMEOUT_MS = 5000;
@@ -41,6 +42,7 @@ async function sendToolCall(
   tool: string,
   params: Record<string, unknown>,
 ): Promise<unknown> {
+  if (isLogicServiceTool(tool)) return callLogicService(tool, params);
   const requestParams = tool === 'daw_import_audio' ? await prepareAudioImport(params) : params;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
