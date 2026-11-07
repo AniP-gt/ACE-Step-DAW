@@ -1,5 +1,5 @@
 import 'fake-indexeddb/auto';
-import { Blob as NodeBlob } from 'node:buffer';
+import { Blob as NodeBlob, File as NodeFile } from 'node:buffer';
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAudioImport } from '../../hooks/useAudioImport';
@@ -48,6 +48,19 @@ describe('audio import', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it('preserves canonical reference bytes instead of re-encoding them', async () => {
+    vi.stubGlobal('File', NodeFile);
+    const file = new File([new Uint8Array([82, 73, 70, 70, 1, 2, 3, 4])], 'reference.wav', { type: 'audio/wav' });
+    const imported = await importAudioFile(file, 0, { preserveSource: true });
+    const persisted = await loadAudioBlobByKey(imported.audioKey);
+    expect(persisted ? new Uint8Array(await persisted.arrayBuffer()) : null).toEqual(new Uint8Array([82, 73, 70, 70, 1, 2, 3, 4]));
+  });
+
+  it('rejects immutable references that would be silently trimmed', async () => {
+    await expect(importAudioFile(audioFile(), 6, { preserveSource: true })).rejects.toThrow('does not fit');
+    expect(useProjectStore.getState().project?.tracks).toEqual([]);
   });
 
   it('does not leave an empty track when GUI import starts at the project end', async () => {

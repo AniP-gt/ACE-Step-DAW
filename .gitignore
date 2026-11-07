@@ -31,6 +31,9 @@ docs/research-notes/
 # Codex artifacts
 .codex/
 
+# Local project skill (machine-specific API launch configuration)
+/.agents/skills/ace-step-api-start/
+
 # Agent session artifacts
 .agent-session-id
 

@@ -14,7 +14,7 @@ concurrency:
 jobs:
   # Critical E2E tests — BLOCKS PR merges.
   e2e-critical:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +28,7 @@ jobs:
       - name: Run critical E2E tests
         id: e2e-critical
         run: |
+          set -o pipefail
           npx playwright test --grep '@critical' --retries=1 --reporter=list,html 2>&1 | tee /tmp/e2e-critical-output.txt
         continue-on-error: true
 
@@ -53,7 +54,7 @@ jobs:
 
   # Extended E2E tests — non-blocking, creates issues on failure
   e2e-extended:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     continue-on-error: true
     steps:

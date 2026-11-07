@@ -25,6 +25,7 @@ import { extractContextAudioLazy } from './lazyContextAudioExtractor';
 import { computeEta } from '../utils/generationProgress';
 import { createDebugLogger } from '../utils/debugLogger';
 import { extractServerPath, sanitizeServerPath } from '../utils/serverPath';
+import { ExplicitContextError, requireLegoModel, validateContextRange, type ExplicitContextRequest } from './explicitContextGeneration';
 
 const logger = createDebugLogger('ace-step:generation');
 
@@ -107,6 +108,7 @@ export interface GenerationOutcome {
 }
 
 export interface ClipInternalOptions {
+  readonly explicitContext?: ExplicitContextRequest;
   /** Force src_audio to silence instead of previousCumulativeBlob */
   forceSilence?: boolean;
   /** Override the clip's prompt with this local description */
@@ -706,6 +708,31 @@ async function getPreviousCumulativeBlob(clipId: string): Promise<Blob | null> {
   return null;
 }
 
+export async function generateFromExplicitContext(request: ExplicitContextRequest): Promise<GenerationOutcome> {
+  validateContextRange(request.frameCount, request.startFrame, request.endFrame);
+  requireLegoModel(useModelStore.getState().availableModels, request.modelId);
+  const store = useProjectStore.getState();
+  if (store.project?.id !== request.projectId || !store.getClipById(request.clipId)) {
+    throw new ExplicitContextError('STALE_BINDING: The bound project or clip is no longer available.');
+  }
+  const generation = useGenerationStore.getState();
+  if (!generation.tryAcquireGenerationLock()) throw new ExplicitContextError('PROJECT_BUSY');
+  if (request.bridgeJobId) useGenerationStore.setState({ backendOccupancyJobId: request.bridgeJobId });
+  try {
+    request.signal.throwIfAborted();
+    return await generateClipInternal(request.clipId, request.canonicalBlob, {
+      explicitContext: request,
+      contextWindow: { startTime: 0, endTime: request.frameCount / 48000 },
+      repaintRange: { start: request.startFrame / 48000, end: request.endFrame / 48000 },
+      chunkMaskMode: 'explicit',
+      seedOverride: request.seed,
+      useRandomSeedOverride: request.seed < 0,
+    });
+  } finally {
+    generation.setIsGenerating(false);
+  }
+}
+
 async function generateClipInternal(
   clipId: string,
   previousCumulativeBlob: Blob | null,
@@ -736,6 +763,17 @@ async function generateClipInternal(
   // Create generation job
   const jobId = uuidv4();
   const abortCtrl = registerJobAbortController(jobId);
+  const externalSignal = options.explicitContext?.signal;
+  const abortFromContext = () => abortCtrl.abort();
+  externalSignal?.addEventListener('abort', abortFromContext, { once: true });
+  if (externalSignal?.aborted) abortCtrl.abort();
+  const assertTarget = () => {
+    const target = useProjectStore.getState().getClipById(clipId);
+    if (options.explicitContext && (useProjectStore.getState().project?.id !== project.id || !target || target.startTime !== clip.startTime || target.duration !== clip.duration)) {
+      abortCtrl.abort();
+    }
+    throwIfAborted(abortCtrl.signal);
+  };
   genStore.addJob({
     id: jobId,
     clipId,
@@ -808,9 +846,10 @@ async function generateClipInternal(
       : `Generate the ${trackLabel} track based on the audio context:`;
 
     // Build params — 'auto' = ACE-Step infers, null/undefined = project defaults, value = manual
-    const resolvedBpm = clip.bpm === 'auto' ? null : (clip.bpm ?? project.bpm);
-    const resolvedKey = clip.keyScale === 'auto' ? '' : (clip.keyScale ?? project.keyScale);
-    const resolvedTimeSig = clip.timeSignature === 'auto' ? '' : String(clip.timeSignature ?? project.timeSignature);
+    const resolvedBpm = options.explicitContext?.sourceTiming?.bpm ?? (clip.bpm === 'auto' ? null : (clip.bpm ?? project.bpm));
+    const resolvedKey = options.explicitContext || clip.keyScale === 'auto' ? '' : (clip.keyScale ?? project.keyScale);
+    const sourceTiming = options.explicitContext?.sourceTiming;
+    const resolvedTimeSig = sourceTiming ? `${sourceTiming.numerator}/${sourceTiming.denominator}` : clip.timeSignature === 'auto' ? '' : String(clip.timeSignature ?? project.timeSignature);
 
     const effectivePrompt = options.localDescription !== undefined ? options.localDescription : (clip.prompt ?? '');
     const clipLevelGlobal = options.globalCaptionOverride !== undefined
@@ -839,7 +878,7 @@ async function generateClipInternal(
       batch_size: 1,
       audio_format: 'wav',
       thinking: false, // lego is a pure DiT task — LM audio codes are out-of-distribution
-      model: useModelStore.getState().getLoadedModelForCategory('lego')
+      model: options.explicitContext?.modelId ?? useModelStore.getState().getLoadedModelForCategory('lego')
         ?? useModelStore.getState().activeModelId
         ?? project.generationDefaults.model,
     } as LegoTaskParams;
@@ -945,11 +984,16 @@ async function generateClipInternal(
     }
     useProjectStore.getState().updateClipStatus(clipId, 'generating');
 
+    options.explicitContext?.onSubmissionStarted?.();
     const releaseResp = await api.releaseLegoTask(srcAudioBlob, params, {
       signal: abortCtrl.signal,
       referenceAudioBlob,
+      retrySubmission: options.explicitContext === undefined,
+      preserveSourceAudio: options.explicitContext !== undefined,
     });
     const taskId = releaseResp.task_id;
+    await options.explicitContext?.onSubmitted(taskId);
+    assertTarget();
     useGenerationStore.getState().updateJob(jobId, { taskId });
     genStore.upsertGenerationHistoryRecord({
       clipId,
@@ -1022,6 +1066,7 @@ async function generateClipInternal(
       throw new Error('Generation timed out — the server did not return a result within the time limit. Try again or check server status.');
     }
 
+    assertTarget();
     // If the project-level global caption was blank, seed it from this generation
     if (effectiveGlobalCaption && !project.globalCaption) {
       useProjectStore.getState().updateProject({ globalCaption: effectiveGlobalCaption });
@@ -1064,6 +1109,9 @@ async function generateClipInternal(
     const engine = getAudioEngine();
     const fullBuffer = await engine.decodeAudioData(cumulativeBlob);
     throwIfAborted(abortCtrl.signal);
+    if (options.explicitContext && (fullBuffer.sampleRate !== 48000 || fullBuffer.numberOfChannels !== 2 || fullBuffer.length < options.explicitContext.endFrame)) {
+      throw new ExplicitContextError('UNSUPPORTED_OUTPUT_FORMAT: Expected full-context 48 kHz stereo output.');
+    }
 
     const currentClip = useProjectStore.getState().getClipById(clipId);
     const clipStart = currentClip?.startTime ?? clip.startTime;
@@ -1089,7 +1137,7 @@ async function generateClipInternal(
       }
     }
 
-    const isolatedBlob = audioBufferToWavBlob(trimmedBuffer);
+    const isolatedBlob = audioBufferToWavBlob(trimmedBuffer, options.explicitContext ? 32 : 16);
     throwIfAborted(abortCtrl.signal);
     const isolatedKey = await saveAudioBlob(project.id, clipId, 'isolated', isolatedBlob);
     throwIfAborted(abortCtrl.signal);
@@ -1097,6 +1145,7 @@ async function generateClipInternal(
     // Compute waveform peaks from the trimmed buffer (full buffer = clip region)
     const peaks = await computeWaveformWithMipmap(isolatedKey, trimmedBuffer);
     throwIfAborted(abortCtrl.signal);
+    assertTarget();
 
     // Build inferred metadata from result
     const inferredMetas: InferredMetas | undefined = firstResult
@@ -1166,14 +1215,16 @@ async function generateClipInternal(
 
     // Handle user cancellation via AbortController
     if (error instanceof DOMException && error.name === 'AbortError') {
-      restoreClipAfterCancellation(clipId, clip);
+      if (useProjectStore.getState().project?.id === project.id && useProjectStore.getState().getClipById(clipId)) restoreClipAfterCancellation(clipId, clip);
       genStore.updateJob(jobId, { status: 'cancelled', progress: 'Cancelled', stage: 'Cancelled' });
       updateVariationProgress({ status: 'cancelled', progress: 'Cancelled', completedAt: Date.now() });
       return { cumulativeBlob: previousCumulativeBlob, succeeded: false, errorMessage: 'Cancelled' };
     }
 
     const message = error instanceof Error ? error.message : 'Unknown error';
-    useProjectStore.getState().updateClipStatus(clipId, 'error', { errorMessage: message });
+    if (!options.explicitContext || useProjectStore.getState().project?.id === project.id) {
+      useProjectStore.getState().updateClipStatus(clipId, 'error', { errorMessage: message });
+    }
     genStore.upsertGenerationHistoryRecord({
       clipId,
       trackId: track.id,
@@ -1208,6 +1259,8 @@ async function generateClipInternal(
       completedAt: Date.now(),
     });
     return { cumulativeBlob: previousCumulativeBlob, succeeded: false, errorMessage: message };
+  } finally {
+    externalSignal?.removeEventListener('abort', abortFromContext);
   }
 }
 

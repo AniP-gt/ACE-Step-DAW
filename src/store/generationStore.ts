@@ -467,6 +467,7 @@ export interface StemsFormDraftRow {
 export interface GenerationState {
   jobs: GenerationJob[];
   isGenerating: boolean;
+  backendOccupancyJobId: string | null;
   promptHistory: PromptHistoryEntry[];
   generationHistory: GenerationHistoryRecord[];
   previewingHistoryId: string | null;
@@ -590,6 +591,7 @@ export const useGenerationStore = create<GenerationState>()(
     (set, get) => ({
       jobs: [],
       isGenerating: false,
+      backendOccupancyJobId: null,
       promptHistory: [],
       generationHistory: [],
       previewingHistoryId: null,
@@ -693,7 +695,7 @@ export const useGenerationStore = create<GenerationState>()(
       setIsGenerating: (v) => set({ isGenerating: v }),
       tryAcquireGenerationLock: () => {
         const state = get();
-        if (state.isGenerating) return false;
+        if (state.isGenerating || state.backendOccupancyJobId) return false;
         set({ isGenerating: true });
         return true;
       },
@@ -1276,6 +1278,7 @@ export const useGenerationStore = create<GenerationState>()(
       name: 'ace-step-daw-generation',
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
+        backendOccupancyJobId: state.backendOccupancyJobId,
         promptHistory: state.promptHistory,
         generationHistory: state.generationHistory,
         generationForm: state.generationForm,

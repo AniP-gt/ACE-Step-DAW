@@ -220,7 +220,7 @@ export function LevelMeter({ trackId, masterStage, returnTrackId, stereo, showSc
         type="button"
         data-clip-btn
         aria-label={clipResetLabel}
-        className="absolute top-1 z-10 rounded-full border border-red-200/40 bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.75)]"
+        className="absolute top-1 z-20 rounded-full border border-red-200/40 bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.75)]"
         style={{ width: CLIP_INDICATOR_SIZE, height: CLIP_INDICATOR_SIZE, display: 'none', left: meterLeft + totalBarWidth / 2 - CLIP_INDICATOR_SIZE / 2 }}
         onClick={resetClip}
         title="Reset clip indicator"

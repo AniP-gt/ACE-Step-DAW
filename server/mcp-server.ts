@@ -15,6 +15,8 @@ import { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { prepareAudioImport } from './audio-import';
+import { LOGIC_TOOLS } from './logic-tools';
+import { callLogicService, isLogicServiceTool } from './logic-client';
 
 const BRIDGE_URL = process.env.DAW_MCP_BRIDGE_URL ?? 'ws://127.0.0.1:5174/ws/mcp-bridge';
 
@@ -47,6 +49,7 @@ interface MCPToolDefinition {
 // ── Tool Definitions ──
 
 const TOOLS: MCPToolDefinition[] = [
+  ...LOGIC_TOOLS,
   {
     name: 'daw_import_audio',
     description: 'Import a generated or existing local audio file into the DAW timeline. After generating audio outside daw_generate, use this tool to place the file in the project before reporting completion. Returns the ready clip ID, track ID, and duration.',
@@ -299,6 +302,7 @@ function connectBridge(): Promise<void> {
 }
 
 async function callBridge(tool: string, params: Record<string, unknown>): Promise<unknown> {
+  if (isLogicServiceTool(tool)) return callLogicService(tool, params);
   const requestParams = tool === 'daw_import_audio' ? await prepareAudioImport(params) : params;
   if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
     await connectBridge();

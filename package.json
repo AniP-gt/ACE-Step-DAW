@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "bridge": "tsx server/logic-bridge/main.ts",
+    "bridge:pair": "tsx server/logic-pair.ts",
     "dev": "vite",
     "build": "npm run build:wasm && tsc -b && vite build",
     "build:wasm": "wasm-pack build crates/ace-dsp-wasm --target web --out-dir ../../src/wasm/pkg --release && node -e \"require('fs').copyFileSync('src/wasm/pkg/ace_dsp_wasm_bg.wasm','public/ace_dsp_wasm_bg.wasm')\"",
@@ -26,6 +28,7 @@
     "dashboard:build": "vite build --config dashboard/vite.config.ts"
   },
   "dependencies": {
+    "@alexanderolsen/libsamplerate-js": "2.1.2",
     "@breezystack/lamejs": "^1.2.7",
     "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-javascript": "^6.2.5",

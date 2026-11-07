@@ -13,6 +13,20 @@ export function parseCommand(args: string[]): ParsedCommand | { error: string } 
   const [cmd, ...rest] = args;
 
   switch (cmd) {
+    case 'logic': {
+      const tool = rest[0];
+      if (!tool || !['logic_list_captures', 'logic_get_job', 'logic_cancel_job', 'logic_export_result', 'daw_attach_logic_capture', 'daw_add_layer_from_context'].includes(tool)) {
+        return { error: 'Usage: daw logic <tool> <JSON arguments>' };
+      }
+      try {
+        const value: unknown = JSON.parse(rest.slice(1).join(' '));
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) return { error: 'Logic arguments must be a JSON object.' };
+        return { tool, params: Object.fromEntries(Object.entries(value)) };
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        return { error: 'Logic arguments must be valid JSON.' };
+      }
+    }
     case 'status':
       return { tool: 'daw_get_project', params: {} };
     case 'tracks':

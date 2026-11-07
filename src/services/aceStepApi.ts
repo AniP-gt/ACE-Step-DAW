@@ -345,6 +345,8 @@ const RELEASE_TASK_MAX_RETRIES = 3;
 interface ApiRequestOptions {
   signal?: AbortSignal;
   referenceAudioBlob?: Blob;
+  retrySubmission?: boolean;
+  readonly preserveSourceAudio?: boolean;
 }
 
 function getUploadFileName(blob: Blob, fallbackBaseName: string): string {
@@ -386,11 +388,12 @@ async function releaseTask(
   );
 
   // Only downsample and upload the blob when no server-side path is provided.
-  const uploadBlob = usePath ? null : await downsampleWavBlob(srcAudioBlob);
+  const uploadBlob = usePath ? null : options?.preserveSourceAudio ? srcAudioBlob : await downsampleWavBlob(srcAudioBlob);
 
   let lastError: Error | null = null;
+  const maxAttempts = options?.retrySubmission === false ? 1 : RELEASE_TASK_MAX_RETRIES;
 
-  for (let attempt = 1; attempt <= RELEASE_TASK_MAX_RETRIES; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const formData = new FormData();
     if (uploadBlob) {
       formData.append('src_audio', uploadBlob, 'src_audio.wav');
@@ -418,7 +421,7 @@ async function releaseTask(
       }
 
       if (attempt > 1) {
-        logger.warn(`releaseLegoTask retry ${attempt}/${RELEASE_TASK_MAX_RETRIES}`);
+        logger.warn(`releaseLegoTask retry ${attempt}/${maxAttempts}`);
       }
 
       const res = await fetch(`${base}/release_task`, {
@@ -448,7 +451,7 @@ async function releaseTask(
 
       logger.error(`releaseLegoTask attempt ${attempt} failed:`, lastError.message);
 
-      if (!isRetryable || attempt === RELEASE_TASK_MAX_RETRIES) break;
+      if (!isRetryable || attempt === maxAttempts) break;
 
       const delay = Math.min(2000 * attempt, 6000);
       await new Promise((r) => setTimeout(r, delay));

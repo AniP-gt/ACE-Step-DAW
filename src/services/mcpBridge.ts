@@ -80,6 +80,10 @@ async function handleToolCall(request: ToolRequest): Promise<ToolResponse> {
 }
 
 async function executeTool(tool: string, params: Record<string, unknown>): Promise<unknown> {
+  if (tool === 'daw_attach_logic_capture' || tool === 'daw_add_layer_from_context') {
+    const bridge = await import('./logicBridge');
+    return tool === 'daw_attach_logic_capture' ? bridge.attachLogicCapture(params) : bridge.addLayerFromLogicContext(params);
+  }
   const project = useProjectStore.getState();
   const transport = useTransportStore.getState();
   const generation = useGenerationStore.getState();
@@ -91,6 +95,7 @@ async function executeTool(tool: string, params: Record<string, unknown>): Promi
       const p = project.project;
       if (!p) return { error: 'No project loaded' };
       return {
+        projectId: p.id,
         name: p.name,
         bpm: p.bpm,
         timeSignature: p.timeSignature,

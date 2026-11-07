@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect } from 'react';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { Toolbar } from './Toolbar';
+import { LogicBridgePanel } from '../logicBridge/LogicBridgePanel';
 import { NewProjectDialog } from '../dialogs/NewProjectDialog';
 import { ToastContainer } from '../ui/Toast';
 import { UndoHistoryPanel } from './UndoHistoryPanel';
@@ -156,6 +157,7 @@ export function EditorShell() {
     >
       <SkipLinks />
       <Toolbar />
+      <LogicBridgePanel />
 
       <section
         id="main-content"
