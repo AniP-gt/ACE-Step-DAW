@@ -16,7 +16,7 @@ import sys
 
 cache = pathlib.Path.home() / 'Library/ACE-Step Bridge/native-results'
 cache.mkdir(parents=True, exist_ok=True)
-existing_sidecars = set(cache.glob('*.json'))
+existing_sidecars = set(cache.rglob('*.json'))
 run_id = uuid.uuid4().hex
 delay_pair = '--pair-race' in sys.argv[2:]
 result_a, result_b = 'race-A-' + run_id, 'race-B-' + run_id
@@ -86,9 +86,9 @@ try:
 finally:
     file_b.unlink(missing_ok=True)
     file_b.with_suffix('.json').unlink(missing_ok=True)
-    for sidecar in set(cache.glob('*.json')) - existing_sidecars:
+    for sidecar in set(cache.rglob('*.json')) - existing_sidecars:
         try:
-            if json.loads(sidecar.read_text()).get('resultId') == result_a:
+            if json.loads(sidecar.read_text()).get('resultId') in (result_a, result_b):
                 sidecar.with_suffix('.wav').unlink(missing_ok=True)
                 sidecar.unlink(missing_ok=True)
         except (OSError, ValueError):

@@ -29,9 +29,9 @@ public:
  const juce::String getProgramName(int) override {return {};}
  void changeProgramName(int,const juce::String&) override {}
  bool hasEditor() const override {return true;} juce::AudioProcessorEditor* createEditor() override;
- void getStateInformation(juce::MemoryBlock& b) override { std::lock_guard<std::mutex> lock(mutex);juce::MemoryOutputStream s(b,false);s.writeString(juce::JSON::toString(object({{"stateId",stateId},{"sessionDisplay",sessionDisplay},{"captureSeconds",captureSeconds},{"resultId",savedResultId},{"cachedFilename",cachedFilename}}))); }
- void setStateInformation(const void* data,int bytes) override { juce::MemoryInputStream s(data,static_cast<size_t>(bytes),false);auto saved=juce::JSON::parse(s.readString());if(!saved.isObject())return;std::lock_guard<std::mutex> lock(mutex);stateId=saved["stateId"].toString();sessionDisplay=saved["sessionDisplay"].toString();captureSeconds=juce::jlimit(1,120,static_cast<int>(saved["captureSeconds"]));savedResultId=saved["resultId"].toString();cachedFilename=saved["cachedFilename"].toString();++selectionRevision;++stateRevision;credentialsResetRequested=true;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;localResult=juce::File();placementText.clear();pending.clear();argument.clear();if(!cachedFilename.isEmpty()){pending="restore";argument.clear();message="Restoring cached result";}else message="Disconnected"; }
- void command(juce::String op,juce::String arg={}) {std::lock_guard<std::mutex> lock(mutex);if(op=="capture")captureSeconds=juce::jlimit(1,120,arg.getIntValue());if(op=="result"){savedResultId=arg;cachedFilename.clear();localResult=juce::File();placementText.clear();++selectionRevision;message="Fetching result";}pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;}
+ void getStateInformation(juce::MemoryBlock& b) override { std::lock_guard<std::mutex> lock(mutex);juce::MemoryOutputStream s(b,false);s.writeString(juce::JSON::toString(object({{"stateId",stateId},{"sessionDisplay",sessionDisplay},{"captureSeconds",captureSeconds},{"resultId",savedResultId},{"cachedFilename",cachedFilename},{"cacheVersion",cacheVersion}}))); }
+ void setStateInformation(const void* data,int bytes) override { juce::MemoryInputStream s(data,static_cast<size_t>(bytes),false);auto saved=juce::JSON::parse(s.readString());if(!saved.isObject())return;std::lock_guard<std::mutex> lock(mutex);stateId=saved["stateId"].toString();sessionDisplay=saved["sessionDisplay"].toString();captureSeconds=juce::jlimit(1,120,static_cast<int>(saved["captureSeconds"]));savedResultId=saved["resultId"].toString();cachedFilename=saved["cachedFilename"].toString();cacheVersion=static_cast<int>(saved["cacheVersion"]);++selectionRevision;++stateRevision;credentialsResetRequested=true;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;localResult=juce::File();placementText.clear();pending.clear();argument.clear();if(!cachedFilename.isEmpty()){pending="restore";argument.clear();message="Restoring cached result";}else message="Disconnected"; }
+ void command(juce::String op,juce::String arg={}) {std::lock_guard<std::mutex> lock(mutex);if(op=="capture")captureSeconds=juce::jlimit(1,120,arg.getIntValue());if(op=="result"){savedResultId=arg;cachedFilename.clear();cacheVersion=1;localResult=juce::File();placementText.clear();++selectionRevision;message="Fetching result";}pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;}
  juce::String savedResult(){std::lock_guard<std::mutex> lock(mutex);return savedResultId;}
  int savedSeconds(){std::lock_guard<std::mutex> lock(mutex);return captureSeconds;}
  juce::String status() {std::lock_guard<std::mutex> lock(mutex);return message;}
@@ -46,7 +46,7 @@ private:
  std::atomic<unsigned> networkRequests{0};
  uint64_t selectionRevision=0,pendingRevision=0,stateRevision=0,pendingStateRevision=0;
  bool credentialsResetRequested=false;
- int captureSeconds=8;
+ int captureSeconds=8,cacheVersion=1;
  juce::String stateId=juce::Uuid().toString(),instanceId=juce::Uuid().toString();
  juce::File localResult;
  juce::String placementText;
@@ -85,6 +85,15 @@ private:
   auto seconds=static_cast<double>(value);if(seconds==0)seconds=0;
   return "Suggested start: "+juce::String(seconds>=0?"+":"")+juce::String(seconds,6)+" s";
  }
+ static juce::File resultDirectory() {return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("ACE-Step Bridge/native-results");}
+ static juce::File writeResultPair(const juce::File& directory,const juce::MemoryBlock& bytes,const juce::var& metadata) {
+  if(directory.isSymbolicLink() || directory.createDirectory().failed())throw juce::String("Cannot create result directory");
+  auto file=directory.getChildFile(juce::Uuid().toString()+".wav");auto sidecar=file.withFileExtension("json");
+  if(file.exists() || sidecar.exists())throw juce::String("Result filename collision");
+  if(!file.replaceWithData(bytes.getData(),bytes.getSize()))throw juce::String("Cannot save result");
+  if(!sidecar.replaceWithText(juce::JSON::toString(metadata))){file.deleteFile();throw juce::String("Cannot save result metadata");}
+  return file;
+ }
  void fetchResult(const juce::String& id,uint64_t revision) {
   {std::lock_guard<std::mutex> lock(mutex);if(revision!=selectionRevision)return;}
   auto metadata=request("GET","/results/"+id);
@@ -100,25 +109,29 @@ private:
   auto hash=metadata["sha256"].toString(); if(hash.isEmpty() || juce::SHA256(bytes).toHexString()!=hash) throw juce::String("Result hash mismatch");
   juce::WavAudioFormat wav; auto reader=std::unique_ptr<juce::AudioFormatReader>(wav.createReaderFor(new juce::MemoryInputStream(bytes,false),true));
   if(!reader || reader->lengthInSamples<=0 || reader->sampleRate!=48000 || reader->numChannels!=2 || reader->lengthInSamples!=static_cast<juce::int64>(metadata["frameCount"])) throw juce::String("Invalid WAV format or frame count");
-  auto dir=juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("ACE-Step Bridge/native-results"); dir.createDirectory();
-  auto file=dir.getChildFile(juce::Uuid().toString()+".wav"); if(!file.replaceWithData(bytes.getData(),bytes.getSize())) throw juce::String("Cannot save result");
-  if(!file.withFileExtension("json").replaceWithText(juce::JSON::toString(metadata))){file.deleteFile();throw juce::String("Cannot save result metadata");}
-  {std::lock_guard<std::mutex> lock(mutex);if(revision==selectionRevision){localResult=file;placementText=placement;cachedFilename=file.getFileName();savedResultId=id;message="Result ready: "+file.getFileName();}}
+  const auto canonical=writeResultPair(resultDirectory().getChildFile("verified-cache"),bytes,metadata);
+  const auto exported=writeResultPair(resultDirectory(),bytes,metadata);
+  {std::lock_guard<std::mutex> lock(mutex);if(revision==selectionRevision){localResult=exported;placementText=placement;cachedFilename=canonical.getFileName();cacheVersion=1;savedResultId=id;message="Result ready: "+exported.getFileName();}}
  }
  void restoreCachedResult() {
-  juce::String name,id;{std::lock_guard<std::mutex> lock(mutex);name=cachedFilename;id=savedResultId;localResult=juce::File();placementText.clear();}
+  juce::String name,id;int version=0;uint64_t revision=0;{std::lock_guard<std::mutex> lock(mutex);name=cachedFilename;id=savedResultId;version=cacheVersion;revision=selectionRevision;localResult=juce::File();placementText.clear();}
   try {
+   if(version!=0 && version!=1)throw juce::String("unsupported cache version");
    const auto stem=name.dropLastCharacters(4);
    if(!name.endsWith(".wav") || name.length()>128 || stem.isEmpty() || !stem.containsOnly("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"))throw juce::String("invalid cache filename");
-   auto file=juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("ACE-Step Bridge/native-results").getChildFile(name);auto sidecar=file.withFileExtension("json");
+   auto directory=version==1?resultDirectory().getChildFile("verified-cache"):resultDirectory();
+   if(directory.isSymbolicLink())throw juce::String("invalid cache directory");
+   auto file=directory.getChildFile(name);auto sidecar=file.withFileExtension("json");
    if(file.isSymbolicLink() || sidecar.isSymbolicLink() || !file.existsAsFile() || !sidecar.existsAsFile())throw juce::String("cached file or metadata is missing");
    if(file.getSize()<=0 || file.getSize()>64*1024*1024 || sidecar.getSize()>65536)throw juce::String("invalid cache size");
    auto metadata=juce::JSON::parse(sidecar);auto placement=checkedPlacement(metadata["placementSeconds"]);juce::MemoryBlock bytes;
    if(id.isEmpty() || metadata["resultId"].toString()!=id || !file.loadFileAsData(bytes) || juce::SHA256(bytes).toHexString()!=metadata["sha256"].toString())throw juce::String("cache integrity check failed");
    juce::WavAudioFormat format;auto reader=std::unique_ptr<juce::AudioFormatReader>(format.createReaderFor(new juce::MemoryInputStream(bytes,false),true));
    if(!reader || reader->sampleRate!=48000 || reader->numChannels!=2 || reader->lengthInSamples<=0 || reader->lengthInSamples!=static_cast<juce::int64>(metadata["frameCount"]))throw juce::String("cached WAV format or frame count is invalid");
-   {std::lock_guard<std::mutex> lock(mutex);if(name==cachedFilename && id==savedResultId){localResult=file;placementText=placement;message="Result ready: "+name;}}
-  }catch(const juce::String& error){std::lock_guard<std::mutex> lock(mutex);if(name==cachedFilename && id==savedResultId)message="Cache unavailable: "+error+". Re-pair and fetch the result again.";}
+   const auto canonical=version==0?writeResultPair(resultDirectory().getChildFile("verified-cache"),bytes,metadata):file;
+   const auto exported=writeResultPair(resultDirectory(),bytes,metadata);
+   {std::lock_guard<std::mutex> lock(mutex);if(revision==selectionRevision){cachedFilename=canonical.getFileName();cacheVersion=1;localResult=exported;placementText=placement;message="Result ready: "+exported.getFileName();}}
+  }catch(const juce::String& error){std::lock_guard<std::mutex> lock(mutex);if(revision==selectionRevision)message="Cache unavailable: "+error+". Re-pair and fetch the result again.";}
  }
  juce::String captureFailure() const {
   switch(ring.failure.load()) {

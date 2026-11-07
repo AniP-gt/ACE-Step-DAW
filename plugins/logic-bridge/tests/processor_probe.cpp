@@ -15,12 +15,33 @@ juce::File bridgeProbeResult(juce::AudioProcessor&);
 unsigned bridgeProbeNetworkRequests(juce::AudioProcessor&);
 juce::String bridgeProbePlacement(juce::AudioProcessor&);
 static bool restoreCache(const juce::File& file,const juce::String& resultId,bool expectReady,const juce::String& overrideName={},const juce::String& expectedPlacement="Suggested start: +0.000000 s") {
+ struct OwnedPairs {std::vector<juce::File> files;~OwnedPairs(){for(const auto& owned:files){owned.deleteFile();owned.withFileExtension("json").deleteFile();}}} cleanup;
  auto* settings=new juce::DynamicObject();settings->setProperty("stateId","offline-fixture");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",resultId);settings->setProperty("cachedFilename",overrideName.isEmpty()?file.getFileName():overrideName);
  juce::MemoryBlock state;{juce::MemoryOutputStream stream(state,false);stream.writeString(juce::JSON::toString(juce::var(settings)));}
  std::unique_ptr<juce::AudioProcessor> restored(createPluginFilter());restored->setStateInformation(state.getData(),static_cast<int>(state.getSize()));
  for(int i=0;i<500;++i){auto status=bridgeProbeStatus(*restored);if(status.startsWith("Result ready:") || status.startsWith("Cache unavailable:"))break;juce::Thread::sleep(10);}
  auto status=bridgeProbeStatus(*restored);bool valid=expectReady?status.startsWith("Result ready:"):status.startsWith("Cache unavailable:");
- valid=valid && (expectReady?bridgeProbePlacement(*restored)==expectedPlacement:bridgeProbePlacement(*restored).isEmpty()) && bridgeProbeNetworkRequests(*restored)==0 && (expectReady?bridgeProbeResult(*restored)==file:bridgeProbeResult(*restored)==juce::File());
+ valid=valid && (expectReady?bridgeProbePlacement(*restored)==expectedPlacement:bridgeProbePlacement(*restored).isEmpty()) && bridgeProbeNetworkRequests(*restored)==0 && (expectReady?bridgeProbeResult(*restored).existsAsFile() && bridgeProbeResult(*restored)!=file && juce::SHA256(bridgeProbeResult(*restored)).toHexString()==juce::SHA256(file).toHexString():bridgeProbeResult(*restored)==juce::File());
+ if(expectReady && valid) {
+  const auto originalHash=juce::SHA256(file).toHexString();const auto exported=bridgeProbeResult(*restored);
+  cleanup.files.push_back(exported);
+  juce::MemoryBlock savedState;restored->getStateInformation(savedState);juce::MemoryInputStream savedStream(savedState,false);auto saved=juce::JSON::parse(savedStream.readString());
+  if(static_cast<int>(saved["cacheVersion"])!=1)return false;
+  auto canonical=file.getParentDirectory().getChildFile("verified-cache").getChildFile(saved["cachedFilename"].toString());cleanup.files.push_back(canonical);
+  if(juce::SHA256(canonical).toHexString()!=originalHash || canonical==exported)return false;
+  juce::MemoryBlock changed;if(!exported.loadFileAsData(changed) || changed.getSize()<12 || std::memcmp(changed.getData(),"RIFF",4)!=0)return false;
+  const unsigned char chunk[]{'J','U','N','K',4,0,0,0,'t','e','s','t'};changed.append(chunk,sizeof(chunk));auto* bytes=static_cast<unsigned char*>(changed.getData());auto riffSize=static_cast<uint32_t>(changed.getSize()-8);for(int i=0;i<4;++i)bytes[4+i]=static_cast<unsigned char>((riffSize>>(i*8))&255);
+  if(!exported.replaceWithData(changed.getData(),changed.getSize()))return false;
+  const auto modifiedHash=juce::SHA256(exported).toHexString();
+  std::unique_ptr<juce::AudioProcessor> reopened(createPluginFilter());reopened->setStateInformation(savedState.getData(),static_cast<int>(savedState.getSize()));
+  for(int i=0;i<500;++i){auto next=bridgeProbeStatus(*reopened);if(next.startsWith("Result ready:") || next.startsWith("Cache unavailable:"))break;juce::Thread::sleep(10);}
+  auto fresh=bridgeProbeResult(*reopened);if(fresh!=juce::File())cleanup.files.push_back(fresh);
+  juce::WavAudioFormat wav;auto alteredReader=std::unique_ptr<juce::AudioFormatReader>(wav.createReaderFor(exported.createInputStream().release(),true));auto freshReader=std::unique_ptr<juce::AudioFormatReader>(wav.createReaderFor(fresh.createInputStream().release(),true));
+  if(!alteredReader || !freshReader || alteredReader->lengthInSamples!=128 || freshReader->lengthInSamples!=128)return false;
+  juce::AudioBuffer<float> alteredAudio(2,128),freshAudio(2,128);if(!alteredReader->read(&alteredAudio,0,128,0,true,true) || !freshReader->read(&freshAudio,0,128,0,true,true))return false;
+  for(int channel=0;channel<2;++channel)if(std::memcmp(alteredAudio.getReadPointer(channel),freshAudio.getReadPointer(channel),128*sizeof(float))!=0)return false;
+  if(!bridgeProbeStatus(*reopened).startsWith("Result ready:") || fresh==exported || juce::SHA256(fresh).toHexString()!=originalHash || juce::SHA256(exported).toHexString()!=modifiedHash || juce::SHA256(canonical).toHexString()!=originalHash || juce::SHA256(file).toHexString()!=originalHash || bridgeProbeNetworkRequests(*reopened)!=0){std::cerr<<"FAIL metadata write to handed-out WAV prevented offline reopen: "<<bridgeProbeStatus(*reopened)<<"\n";return false;}
+ }
  restored->prepareToPlay(48000,32);juce::AudioBuffer<float> audio(2,32);juce::MidiBuffer midi;for(int c=0;c<2;++c)for(int i=0;i<32;++i)audio.setSample(c,i,.25f);restored->processBlock(audio,midi);for(int c=0;c<2;++c)for(int i=0;i<32;++i)valid=valid && audio.getSample(c,i)==.25f;restored->releaseResources();
  if(!valid)std::cerr<<"Offline restore unexpected status: "<<status<<"\n";
  return valid;
@@ -40,7 +61,7 @@ static bool offlineCacheChecks() {
  if(!restoreCache(file,"wrong-result-id",false) || !restoreCache(file,id,false,"../escape.wav") || !restoreCache(file,id,false,"..\\escape.wav"))return false;
  metadata->setProperty("frameCount",129);sidecar.replaceWithText(juce::JSON::toString(data));if(!restoreCache(file,id,false))return false;metadata->setProperty("frameCount",128);sidecar.replaceWithText(juce::JSON::toString(data));
  file.replaceWithText("corrupt fixture");if(!restoreCache(file,id,false))return false;file.deleteFile();if(!restoreCache(file,id,false))return false;
- std::cout<<"PASS offline new-processor cache restore; signed placement; missing/nonnumeric/nonfinite placement, mismatched ID/frame count, traversal, corrupt and missing WAV rejected\n";return true;
+ std::cout<<"PASS immutable cache survives writable export RIFF metadata append; fresh copy exact audio, original export preserved; offline signed placement; missing/nonnumeric/nonfinite placement, mismatched ID/frame count, traversal, corrupt and missing WAV rejected\n";return true;
 }
 static bool dragGestureChecks() {
  juce::TemporaryFile fixture(".wav");if(!fixture.getFile().replaceWithText("drag gesture fixture"))return false;
@@ -71,7 +92,7 @@ int main(int argc,char** argv) {
   const juce::File cached(argv[2]),outputDirectory(argv[3]);auto metadata=juce::JSON::parse(cached.withFileExtension("json"));
   auto* settings=new juce::DynamicObject();settings->setProperty("stateId","placement-snapshot");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",metadata["resultId"]);settings->setProperty("cachedFilename",cached.getFileName());juce::MemoryBlock state;{juce::MemoryOutputStream stream(state,false);stream.writeString(juce::JSON::toString(juce::var(settings)));}p->setStateInformation(state.getData(),static_cast<int>(state.getSize()));
   for(int i=0;i<500 && !bridgeProbeStatus(*p).startsWith("Result ready:");++i)juce::Thread::sleep(10);
-  if(bridgeProbeResult(*p)!=cached || bridgeProbePlacement(*p)!="Suggested start: +0.000000 s" || bridgeProbeNetworkRequests(*p)!=0)return 25;
+  if(!bridgeProbeResult(*p).existsAsFile() || juce::SHA256(bridgeProbeResult(*p)).toHexString()!=juce::SHA256(cached).toHexString() || bridgeProbePlacement(*p)!="Suggested start: +0.000000 s" || bridgeProbeNetworkRequests(*p)!=0)return 25;
   outputDirectory.createDirectory();std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);
   for(auto size:{juce::Point<int>{440,360},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output(outputDirectory.getChildFile("restored-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!output.openedOk())return 26;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 26;}
   std::cout<<"PASS restored actual result placement: "<<bridgeProbePlacement(*p)<<"; screenshots 440x360 and 880x720; zero HTTP requests\n";
@@ -90,7 +111,7 @@ int main(int argc,char** argv) {
   directory.getChildFile("release-response").replaceWithText("release");
   for(int i=0;i<500 && !bridgeProbeStatus(*p).startsWith("Result ready:");++i)juce::Thread::sleep(10);
   juce::Thread::sleep(100);juce::MemoryBlock finalState;p->getStateInformation(finalState);juce::MemoryInputStream stream(finalState,false);auto saved=juce::JSON::parse(stream.readString());
-  if(saved["resultId"].toString()!=config["resultB"].toString() || saved["cachedFilename"].toString()!=argv[3] || bridgeProbeResult(*p).getFileName()!=argv[3]){std::cerr<<"FAIL delayed result A overwrote restored state B\n";return 22;}
+  if(saved["resultId"].toString()!=config["resultB"].toString() || static_cast<int>(saved["cacheVersion"])!=1 || !bridgeProbeResult(*p).existsAsFile() || juce::SHA256(bridgeProbeResult(*p)).toHexString()!=juce::SHA256(juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory).getChildFile("ACE-Step Bridge/native-results").getChildFile(argv[3])).toHexString()){std::cerr<<"FAIL delayed result A overwrote restored state B\n";return 22;}
   bridgeProbeCommand(*p,"result","new-selection");juce::MemoryBlock selectionState;p->getStateInformation(selectionState);juce::MemoryInputStream selectedStream(selectionState,false);auto selected=juce::JSON::parse(selectedStream.readString());
   if(bridgeProbeResult(*p)!=juce::File() || selected["cachedFilename"].toString().isNotEmpty() || selected["resultId"].toString()!="new-selection")return 23;
   bridgeProbeCommand(*p,"capture","1");
@@ -118,13 +139,14 @@ int main(int argc,char** argv) {
   const auto hash=juce::SHA256(file).toHexString();
   if(!reader || reader->lengthInSamples<=0 || reader->sampleRate!=48000 || reader->numChannels!=2 || reader->lengthInSamples!=static_cast<juce::int64>(metadata["frameCount"]) || hash!=metadata["sha256"].toString() || metadata["resultId"].toString()!=argv[3]){std::cerr<<"Cached WAV/sidecar validation failed\n";return 13;}
   juce::MemoryBlock persisted;p->getStateInformation(persisted);juce::MemoryInputStream persistedStream(persisted,false);auto persistedData=juce::JSON::parse(persistedStream.readString());
-  if(persistedData["cachedFilename"].toString()!=file.getFileName() || persistedData.hasProperty("token") || persistedData.hasProperty("credential"))return 15;
+  auto canonical=file.getParentDirectory().getChildFile("verified-cache").getChildFile(persistedData["cachedFilename"].toString());
+  if(static_cast<int>(persistedData["cacheVersion"])!=1 || canonical==file || juce::SHA256(canonical).toHexString()!=hash || persistedData.hasProperty("token") || persistedData.hasProperty("credential"))return 15;
   std::unique_ptr<juce::AudioProcessor> reopened(createPluginFilter());reopened->setStateInformation(persisted.getData(),static_cast<int>(persisted.getSize()));
   for(int i=0;i<500 && !bridgeProbeStatus(*reopened).startsWith("Result ready:");++i)juce::Thread::sleep(10);
-  if(bridgeProbeResult(*reopened)!=file || !bridgeProbeResult(*reopened).existsAsFile() || bridgeProbeNetworkRequests(*reopened)!=0 || bridgeProbePlacement(*reopened)!="Suggested start: +0.000000 s"){std::cerr<<"Downloaded result offline reopen failed\n";return 16;}
+  if(bridgeProbeResult(*reopened)==file || !bridgeProbeResult(*reopened).existsAsFile() || juce::SHA256(bridgeProbeResult(*reopened)).toHexString()!=hash || bridgeProbeNetworkRequests(*reopened)!=0 || bridgeProbePlacement(*reopened)!="Suggested start: +0.000000 s"){std::cerr<<"Downloaded result offline reopen failed\n";return 16;}
   std::cout<<"PASS downloaded result actual serialized-state new-processor offline reopen; zero HTTP requests; drag file exists\n";
   std::cout<<"PASS actual native worker: pairing, result HTTP download, SHA256, WAV decode, canonical format and frame count\n"
-           <<"file="<<file.getFullPathName()<<"\nsha256="<<hash<<"\nframes="<<reader->lengthInSamples<<"\n";
+           <<"file="<<file.getFullPathName()<<"\ncanonical="<<canonical.getFullPathName()<<"\nreopenedExport="<<bridgeProbeResult(*reopened).getFullPathName()<<"\nsha256="<<hash<<"\nframes="<<reader->lengthInSamples<<"\n";
  }
  if(argc==2) {
   bridgeProbeCommand(*p,"pair",argv[1]);
