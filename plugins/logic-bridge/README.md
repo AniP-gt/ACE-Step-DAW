@@ -28,3 +28,13 @@ python3 plugins/logic-bridge/tests/cache_race_probe.py plugins/logic-bridge/buil
 ```
 
 The fixture delays a real HTTP result or pairing response, restores another cached AU state before releasing it, and verifies that the late response cannot replace the restored selection or credentials. Loading host state clears runtime credentials on the worker and requires explicit re-pairing for subsequent captures. Cached files remain available offline.
+
+### Slow canonicalization response regression
+
+JUCE maps its connection timeout option to macOS request idle timeout. Capture finalization allows 30 seconds without response activity for offline canonical conversion; other requests retain 3 seconds. This does not change the audio render thread. With the real bridge service stopped by its owner, run:
+
+```sh
+python3 plugins/logic-bridge/tests/finalize_timeout_probe.py plugins/logic-bridge/build/processor_probe_artefacts/Debug/processor_probe
+```
+
+The loopback fixture receives an actual 1-second native capture and delays the finalize response by 8 seconds. It never starts model inference or stops an existing service. Restart the real service after the fixture exits.

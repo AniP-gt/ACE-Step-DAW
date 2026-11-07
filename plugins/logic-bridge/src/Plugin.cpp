@@ -56,7 +56,8 @@ private:
   if(binary) url=url.withPOSTData(*binary); else if(!body.isVoid()) url=url.withPOSTData(juce::JSON::toString(body));
   int code=0;
   auto headers="X-Bridge-Protocol: 1\r\nAuthorization: Bearer "+token+"\r\nContent-Type: "+(binary?juce::String("application/octet-stream"):juce::String("application/json"))+"\r\n"+extra;
-  auto stream=url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress).withHttpRequestCmd(method).withExtraHeaders(headers).withConnectionTimeoutMs(3000).withStatusCode(&code).withNumRedirectsToFollow(0));
+  const int timeoutMs=(method=="POST" && path.startsWith("/captures/") && path.endsWith("/finalize"))?30000:3000;
+  auto stream=url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress).withHttpRequestCmd(method).withExtraHeaders(headers).withConnectionTimeoutMs(timeoutMs).withStatusCode(&code).withNumRedirectsToFollow(0));
   if(!stream) throw juce::String("Service unavailable");
   auto response=juce::JSON::parse(stream->readEntireStreamAsString());
   if(code<200 || code>=300) throw juce::String("HTTP ")+juce::String(code)+": "+response["error"]["message"].toString();
