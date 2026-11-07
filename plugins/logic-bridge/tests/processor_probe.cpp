@@ -2,6 +2,7 @@
 #include <juce_cryptography/juce_cryptography.h>
 #include <iostream>
 #include <cstring>
+#include "../src/ResultDragButton.h"
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter();
 class Playhead final:public juce::AudioPlayHead {
 public:
@@ -41,8 +42,25 @@ static bool offlineCacheChecks() {
  file.replaceWithText("corrupt fixture");if(!restoreCache(file,id,false))return false;file.deleteFile();if(!restoreCache(file,id,false))return false;
  std::cout<<"PASS offline new-processor cache restore; signed placement; missing/nonnumeric/nonfinite placement, mismatched ID/frame count, traversal, corrupt and missing WAV rejected\n";return true;
 }
+static bool dragGestureChecks() {
+ juce::TemporaryFile fixture(".wav");if(!fixture.getFile().replaceWithText("drag gesture fixture"))return false;
+ int attempts=0;bool validArguments=true,platformAccepts=true;juce::File available=fixture.getFile();
+ ResultDragButton button([&]{return available;},[&](const juce::StringArray& files,bool canMove,juce::Component* source){++attempts;validArguments=validArguments && files.size()==1 && files[0]==fixture.getFile().getFullPathName() && !canMove && source==&button;return platformAccepts;});button.setSize(200,36);
+ auto event=[&](float distance,int modifiers){auto now=juce::Time::getCurrentTime();return juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),{10+distance,10},juce::ModifierKeys(modifiers),1,0,0,0,0,&button,&button,now,{10,10},now,1,distance>=5);};
+ const int left=juce::ModifierKeys::leftButtonModifier;
+ button.mouseDown(event(0,left));button.mouseUp(event(0,0));if(attempts!=0)return false;
+ button.mouseDown(event(0,left));button.mouseDrag(event(4,left));if(attempts!=0)return false;
+ button.mouseDrag(event(5,left));button.mouseDrag(event(20,left));button.mouseUp(event(20,0));button.mouseDrag(event(30,0));if(attempts!=1)return false;
+ button.mouseDown(event(0,left));button.mouseDrag(event(6,left));button.mouseUp(event(6,0));if(attempts!=2)return false;
+ available=juce::File();button.mouseDown(event(0,left));button.mouseDrag(event(20,left));button.mouseUp(event(20,0));if(attempts!=2)return false;available=fixture.getFile();
+ button.setEnabled(false);button.mouseDown(event(0,left));button.mouseDrag(event(20,left));button.mouseUp(event(20,0));if(attempts!=2)return false;button.setEnabled(true);
+ button.mouseDown(event(0,juce::ModifierKeys::rightButtonModifier));button.mouseDrag(event(20,juce::ModifierKeys::rightButtonModifier));button.mouseUp(event(20,0));if(attempts!=2)return false;
+ platformAccepts=false;button.mouseDown(event(0,left));button.mouseDrag(event(6,left));button.mouseDrag(event(20,left));button.mouseUp(event(20,0));if(attempts!=3 || !button.getTooltip().contains("Reveal in Finder"))return false;
+ if(!validArguments)return false;std::cout<<"PASS drag gesture: no click/subthreshold/missing/disabled/right-button start; one copy-only platform-call per left drag, retry next gesture, Finder fallback on platform refusal\n";return true;
+}
 int main(int argc,char** argv) {
  juce::ScopedJuceInitialiser_GUI init;
+ if(!dragGestureChecks())return 27;
  std::unique_ptr<juce::AudioProcessor> p(createPluginFilter());Playhead head;p->setPlayHead(&head);p->prepareToPlay(48000,512);
  juce::AudioBuffer<float> audio(2,512);juce::MidiBuffer midi;
  for(int b=0;b<1000;++b) {for(int c=0;c<2;++c)for(int i=0;i<512;++i)audio.setSample(c,i,static_cast<float>((b+i+c)%101)/101.0f);juce::AudioBuffer<float> before;before.makeCopyOf(audio);p->processBlock(audio,midi);for(int c=0;c<2;++c)if(std::memcmp(audio.getReadPointer(c),before.getReadPointer(c),512*sizeof(float))!=0)return 1;head.frame+=512;}

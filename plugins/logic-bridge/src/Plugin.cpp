@@ -1,6 +1,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_cryptography/juce_cryptography.h>
 #include "CaptureRing.h"
+#include "ResultDragButton.h"
 #include <mutex>
 #include <cmath>
 
@@ -165,16 +166,17 @@ class BridgeEditor final : public juce::AudioProcessorEditor,private juce::Timer
  BridgeProcessor& bridge;
  juce::Label statusLabel,durationLabel,placementLabel;
  juce::TextEditor code,length,resultId;
- juce::TextButton pair{"Pair"},capture{"Capture"},cancel{"Cancel"},fetch{"Fetch result"},drag{"Drag WAV"},reveal{"Reveal in Finder"};
+ juce::TextButton pair{"Pair"},capture{"Capture"},cancel{"Cancel"},fetch{"Fetch result"},reveal{"Reveal in Finder"};
+ ResultDragButton drag;
 public:
- explicit BridgeEditor(BridgeProcessor& p):AudioProcessorEditor(p),bridge(p) {
+ explicit BridgeEditor(BridgeProcessor& p):AudioProcessorEditor(p),bridge(p),drag([this]{return bridge.result();}) {
   for(auto* c:std::initializer_list<juce::Component*>{&statusLabel,&durationLabel,&placementLabel,&code,&length,&resultId,&pair,&capture,&cancel,&fetch,&drag,&reveal}) addAndMakeVisible(c);
   placementLabel.setName("Suggested start");placementLabel.setTitle("Suggested placement in Logic");placementLabel.setDescription("Seconds from project start. Place the WAV manually in Logic.");placementLabel.setEditable(false,false,false);placementLabel.setWantsKeyboardFocus(true);
   code.setTextToShowWhenEmpty("One-use pairing code",findColour(juce::Label::textColourId));code.setTitle("Pairing code");
   durationLabel.setText("Seconds",juce::dontSendNotification);length.setText(juce::String(bridge.savedSeconds()));length.setTitle("Capture seconds (1 to 120)");
   resultId.setText(bridge.savedResult());resultId.setTextToShowWhenEmpty("Result UUID",findColour(juce::Label::textColourId));resultId.setTitle("Result UUID");
   pair.onClick=[this]{bridge.command("pair",code.getText());code.clear();}; capture.onClick=[this]{bridge.command("capture",length.getText());};cancel.onClick=[this]{bridge.command("cancel");};fetch.onClick=[this]{bridge.command("result",resultId.getText());};
-  drag.onClick=[this]{auto f=bridge.result();if(f.existsAsFile())juce::DragAndDropContainer::performExternalDragDropOfFiles({f.getFullPathName()},false,this);};reveal.onClick=[this]{bridge.result().revealToUser();};
+  reveal.onClick=[this]{bridge.result().revealToUser();};
   setResizable(true,true);setResizeLimits(440,360,880,720);setSize(440,360);timerCallback();startTimerHz(10);
  }
  void timerCallback() override {auto s=bridge.status();statusLabel.setText(s,juce::dontSendNotification);bool busy=s.startsWith("Armed")||s=="Capturing"||s=="Uploading";capture.setEnabled(!busy);pair.setEnabled(!busy);length.setEnabled(!busy);fetch.setEnabled(!busy);auto placement=bridge.placement();placementLabel.setText(placement.isEmpty()?"Suggested start: unavailable":placement,juce::dontSendNotification);bool ready=bridge.result().existsAsFile();drag.setEnabled(ready);reveal.setEnabled(ready);}
