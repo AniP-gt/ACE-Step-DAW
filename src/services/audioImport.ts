@@ -18,8 +18,10 @@ class AudioImportError extends Error {
 export async function importAudioFile(
   file: File,
   startTime = 0,
-  trackId?: string,
+  target?: string | { readonly trackId?: string; readonly preserveSource: boolean },
 ): Promise<AudioImportResult> {
+  const trackId = typeof target === 'string' ? target : target?.trackId;
+  const preserveSource = typeof target === 'object' && target.preserveSource;
   const project = useProjectStore.getState().project;
   if (!project) throw new AudioImportError('No project open');
   if (!Number.isFinite(startTime) || startTime < 0 || startTime >= project.totalDuration) {
@@ -39,6 +41,7 @@ export async function importAudioFile(
     throw new AudioImportError(`Track not found: ${trackId}`);
   }
   const duration = Math.min(audioBuffer.duration, currentProject.totalDuration - startTime);
+  if (preserveSource && duration < audioBuffer.duration) throw new AudioImportError('Immutable reference does not fit the project');
   if (!Number.isFinite(duration) || duration <= 0) {
     throw new RangeError('Audio must have a positive duration within the project');
   }
@@ -48,7 +51,7 @@ export async function importAudioFile(
   for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
     trimmedBuffer.getChannelData(channel).set(audioBuffer.getChannelData(channel).subarray(0, trimmedLength));
   }
-  const wavBlob = audioBufferToWavBlob(trimmedBuffer);
+  const wavBlob = preserveSource ? file : audioBufferToWavBlob(trimmedBuffer);
   const store = useProjectStore.getState();
   const targetTrackId = trackId ?? store.addTrack('custom', 'sample', {
     displayName: file.name.replace(/\.[^.]+$/, ''),

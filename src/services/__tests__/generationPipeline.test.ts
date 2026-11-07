@@ -77,8 +77,80 @@ import {
   generateRepaintClip,
   generateText2Music,
   generateVocalReplacement,
+  generateFromExplicitContext,
 } from '../generationPipeline';
 import type { Clip } from '../../types/project';
+import type { LegoTaskParams } from '../../types/api';
+
+vi.mock('../../utils/audioDownsample', () => ({ downsampleWavBlob: async (blob: Blob) => blob }));
+
+describe('explicit canonical source', () => {
+  afterEach(() => { useGenerationStore.setState({ backendOccupancyJobId: null }); vi.unstubAllGlobals(); });
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useProjectStore.setState(useProjectStore.getInitialState(), true);
+    useGenerationStore.setState(useGenerationStore.getInitialState(), true);
+    useProjectStore.getState().createProject();
+    useModelStore.setState({ availableModels: [{ name: 'base', is_loaded: true, is_default: false, supported_task_types: ['lego'] }], activeModelId: 'turbo' });
+  });
+
+  it('uploads the exact canonical bytes despite overlapping audible layers and selected Turbo', async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.project?.id ?? '';
+    for (const name of ['guitar', 'drums', 'keyboard'] as const) {
+      const track = store.addTrack(name);
+      store.addClip(track.id, { startTime: 0, duration: 2, prompt: 'Unrelated audible audio', lyrics: '' });
+    }
+    const target = store.addTrack('bass');
+    const clip = store.addClip(target.id, { startTime: 0.5, duration: 1, prompt: 'Bass', lyrics: '' });
+    const canonical = new Blob(['immutable Logic reference']);
+    const mixerBefore = useProjectStore.getState().project?.tracks.map(track => [track.id, track.muted, track.soloed]);
+    mockReleaseLegoTask.mockRejectedValue(new Error('wire fixture ends at submission'));
+    await generateFromExplicitContext({ sourceTiming: { bpm: 150, numerator: 7, denominator: 8 }, projectId, clipId: clip.id, canonicalBlob: canonical, frameCount: 96000, startFrame: 24000, endFrame: 72000, modelId: 'base', seed: 5, signal: new AbortController().signal, onSubmitted: async () => {} });
+    expect(mockReleaseLegoTask.mock.calls[0][0]).toBe(canonical);
+    expect(mockReleaseLegoTask.mock.calls[0][1]).toMatchObject({ model: 'base', task_type: 'lego', audio_duration: 2, repainting_start: 0.5, repainting_end: 1.5, bpm: 150, time_signature: '7/8' });
+    expect(useProjectStore.getState().project?.tracks.map(track => [track.id, track.muted, track.soloed])).toEqual(mixerBefore);
+  });
+
+  it('rejects busy projects before adding pipeline jobs', async () => {
+    const store = useProjectStore.getState();
+    const track = store.addTrack('bass');
+    const clip = store.addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+    useGenerationStore.setState({ isGenerating: true });
+    await expect(generateFromExplicitContext({ projectId: store.project?.id ?? '', clipId: clip.id, canonicalBlob: new Blob(['context']), frameCount: 48000, startFrame: 0, endFrame: 48000, modelId: 'base', seed: 0, signal: new AbortController().signal, onSubmitted: async () => {} })).rejects.toThrow('PROJECT_BUSY');
+    expect(useGenerationStore.getState().jobs).toEqual([]);
+  });
+
+  it('sends an empty multipart key for explicit audio despite a C major project', async () => {
+    const actualApi = await vi.importActual<typeof import('../aceStepApi')>('../aceStepApi');
+    useProjectStore.getState().updateProject({ keyScale: 'C major' });
+    const store = useProjectStore.getState();
+    const track = store.addTrack('bass');
+    const clip = store.addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+    let submitted: FormData | undefined;
+    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
+      if (init.body instanceof FormData) submitted = init.body;
+      return new Response(JSON.stringify({ data: { task_id: 'fixture-task' } }));
+    });
+    mockReleaseLegoTask.mockImplementation((blob: Blob, params: LegoTaskParams) => actualApi.releaseLegoTask(blob, params));
+    await generateFromExplicitContext({ projectId: store.project?.id ?? '', clipId: clip.id, canonicalBlob: new Blob(['reference']), frameCount: 48000, startFrame: 0, endFrame: 48000, modelId: 'base', seed: 0, signal: new AbortController().signal, onSubmitted: async () => { throw new Error('Fixture stops after multipart submission'); } });
+    expect(submitted?.get('key_scale')).toBe('');
+    expect(useProjectStore.getState().project?.keyScale).toBe('C major');
+  });
+
+  it('does not restore a reference target removed immediately after backend submission', async () => {
+    const store = useProjectStore.getState();
+    const track = store.addTrack('bass');
+    const clip = store.addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+    mockReleaseLegoTask.mockResolvedValue({ task_id: 'late-result' });
+    const result = await generateFromExplicitContext({ bridgeJobId: 'bridge-late-result', projectId: store.project?.id ?? '', clipId: clip.id, canonicalBlob: new Blob(['context']), frameCount: 48000, startFrame: 0, endFrame: 48000, modelId: 'base', seed: 0, signal: new AbortController().signal, onSubmitted: async () => { store.removeClip(clip.id); } });
+    expect(result.succeeded).toBe(false);
+    expect(useProjectStore.getState().getClipById(clip.id)).toBeUndefined();
+    expect(mockDownloadAudio).not.toHaveBeenCalled();
+    expect(useGenerationStore.getState().backendOccupancyJobId).toBe('bridge-late-result');
+    expect(useGenerationStore.getState().tryAcquireGenerationLock()).toBe(false);
+  });
+});
 
 // Helper: create a fake AudioBuffer
 function fakeAudioBuffer(duration = 5): AudioBuffer {

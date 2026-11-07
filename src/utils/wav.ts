@@ -1,4 +1,4 @@
-export function audioBufferToWavBlob(buffer: AudioBuffer, bitsPerSample: 16 | 24 = 16): Blob {
+export function audioBufferToWavBlob(buffer: AudioBuffer, bitsPerSample: 16 | 24 | 32 = 16): Blob {
   const numChannels = buffer.numberOfChannels;
   const sampleRate = buffer.sampleRate;
   const length = buffer.length;
@@ -18,7 +18,7 @@ export function audioBufferToWavBlob(buffer: AudioBuffer, bitsPerSample: 16 | 24
   // fmt chunk
   writeString(view, 12, 'fmt ');
   view.setUint32(16, 16, true);          // chunk size
-  view.setUint16(20, 1, true);           // PCM format
+  view.setUint16(20, bitsPerSample === 32 ? 3 : 1, true);
   view.setUint16(22, numChannels, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, byteRate, true);
@@ -38,8 +38,11 @@ export function audioBufferToWavBlob(buffer: AudioBuffer, bitsPerSample: 16 | 24
   let offset = 44;
   for (let i = 0; i < length; i++) {
     for (let ch = 0; ch < numChannels; ch++) {
-      const sample = Math.max(-1, Math.min(1, channels[ch][i]));
-      if (bitsPerSample === 24) {
+      const sample = bitsPerSample === 32 ? channels[ch][i] : Math.max(-1, Math.min(1, channels[ch][i]));
+      if (bitsPerSample === 32) {
+        view.setFloat32(offset, sample, true);
+        offset += 4;
+      } else if (bitsPerSample === 24) {
         const int24 = Math.round(sample < 0 ? sample * 0x800000 : sample * 0x7FFFFF);
         const clamped = Math.max(-0x800000, Math.min(0x7FFFFF, int24));
         view.setUint8(offset, clamped & 0xFF);
