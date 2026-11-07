@@ -984,10 +984,12 @@ async function generateClipInternal(
     }
     useProjectStore.getState().updateClipStatus(clipId, 'generating');
 
+    options.explicitContext?.onSubmissionStarted?.();
     const releaseResp = await api.releaseLegoTask(srcAudioBlob, params, {
       signal: abortCtrl.signal,
       referenceAudioBlob,
       retrySubmission: options.explicitContext === undefined,
+      preserveSourceAudio: options.explicitContext !== undefined,
     });
     const taskId = releaseResp.task_id;
     await options.explicitContext?.onSubmitted(taskId);

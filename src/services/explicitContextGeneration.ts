@@ -29,5 +29,6 @@ export interface ExplicitContextRequest {
   readonly modelId: string;
   readonly seed: number;
   readonly signal: AbortSignal;
+  readonly onSubmissionStarted?: () => void;
   readonly onSubmitted: (taskId: string) => Promise<void>;
 }

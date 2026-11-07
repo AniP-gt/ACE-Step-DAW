@@ -346,6 +346,7 @@ interface ApiRequestOptions {
   signal?: AbortSignal;
   referenceAudioBlob?: Blob;
   retrySubmission?: boolean;
+  readonly preserveSourceAudio?: boolean;
 }
 
 function getUploadFileName(blob: Blob, fallbackBaseName: string): string {
@@ -387,7 +388,7 @@ async function releaseTask(
   );
 
   // Only downsample and upload the blob when no server-side path is provided.
-  const uploadBlob = usePath ? null : await downsampleWavBlob(srcAudioBlob);
+  const uploadBlob = usePath ? null : options?.preserveSourceAudio ? srcAudioBlob : await downsampleWavBlob(srcAudioBlob);
 
   let lastError: Error | null = null;
   const maxAttempts = options?.retrySubmission === false ? 1 : RELEASE_TASK_MAX_RETRIES;
