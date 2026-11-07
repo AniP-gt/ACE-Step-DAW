@@ -377,8 +377,8 @@ const ChannelStrip = React.memo(function ChannelStrip({ track, faderHeight, retu
       </div>
 
       {/* Fader + meter region */}
-      <div data-testid="fader-region" className="mt-2 flex shrink-0 min-h-[96px] flex-col items-center justify-end gap-1.5 self-stretch border-t border-[#3a3a3a] pt-2 pb-1" style={{ height: faderHeight + 24 }}>
-        <div className="relative" style={{ height: faderHeight }}>
+      <div data-testid="fader-region" className="mt-2 flex shrink-0 min-h-[96px] flex-col items-center justify-end gap-1.5 self-stretch border-t border-[#3a3a3a] pt-2 pb-1">
+        <div className="relative shrink-0" style={{ height: faderHeight }}>
           <LevelMeter trackId={track.id} stereo showScale />
           <VerticalFader
             value={vol}
@@ -506,12 +506,12 @@ function MasterStrip({ faderHeight }: MasterStripProps) {
         {aiMixPanelOpen && <AiMixPanel />}
         <MasteringPanel />
       </div>
-      <div data-testid="master-fader-region" className="mt-1 flex shrink-0 min-h-[96px] flex-col items-center justify-end gap-1 self-stretch pb-1" style={{ height: faderHeight + 24 }}>
+      <div data-testid="master-fader-region" className="mt-1 flex shrink-0 min-h-[96px] flex-col items-center justify-end gap-1 self-stretch pb-1">
         <div className="flex items-center gap-1 text-[9px] text-zinc-500 uppercase tracking-widest mb-1">
           <span>IN</span>
           <span className="mx-2">OUT</span>
         </div>
-        <div className="relative flex gap-2" style={{ height: faderHeight }}>
+        <div className="relative flex shrink-0 gap-2" style={{ height: faderHeight }}>
           <LevelMeter masterStage="input" stereo={false} />
           <div className="relative">
             <LevelMeter masterStage="output" stereo={false} showScale />
