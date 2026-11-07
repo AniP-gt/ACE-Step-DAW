@@ -138,6 +138,28 @@ describe('explicit canonical source', () => {
     expect(useProjectStore.getState().project?.keyScale).toBe('C major');
   });
 
+  it('keeps uncertain explicit submission occupied without a second request or task receipt', async () => {
+    vi.useFakeTimers();
+    try {
+      const actualApi = await vi.importActual<typeof import('../aceStepApi')>('../aceStepApi');
+      mockReleaseLegoTask.mockImplementation((...args: Parameters<typeof actualApi.releaseLegoTask>) => actualApi.releaseLegoTask(...args));
+      const transport = vi.fn().mockRejectedValue(new TypeError('Lost accepted submission response'));
+      vi.stubGlobal('fetch', transport);
+      const store = useProjectStore.getState();
+      const track = store.addTrack('bass');
+      const clip = store.addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+      const onSubmitted = vi.fn();
+      const execution = generateFromExplicitContext({ bridgeJobId: 'uncertain-submission', projectId: store.project?.id ?? '', clipId: clip.id, canonicalBlob: new Blob(['reference']), frameCount: 48000, startFrame: 0, endFrame: 48000, modelId: 'base', seed: 0, signal: new AbortController().signal, onSubmitted });
+      await vi.advanceTimersByTimeAsync(6001);
+      expect(await execution).toMatchObject({ succeeded: false, errorMessage: 'Lost accepted submission response' });
+      expect(transport).toHaveBeenCalledTimes(1);
+      expect(onSubmitted).not.toHaveBeenCalled();
+      expect(mockQueryResult).not.toHaveBeenCalled();
+      expect(useGenerationStore.getState().backendOccupancyJobId).toBe('uncertain-submission');
+      expect(useGenerationStore.getState().tryAcquireGenerationLock()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('does not restore a reference target removed immediately after backend submission', async () => {
     const store = useProjectStore.getState();
     const track = store.addTrack('bass');

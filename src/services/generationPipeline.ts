@@ -987,6 +987,7 @@ async function generateClipInternal(
     const releaseResp = await api.releaseLegoTask(srcAudioBlob, params, {
       signal: abortCtrl.signal,
       referenceAudioBlob,
+      retrySubmission: options.explicitContext === undefined,
     });
     const taskId = releaseResp.task_id;
     await options.explicitContext?.onSubmitted(taskId);

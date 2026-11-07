@@ -24,6 +24,33 @@ describe('Logic executor cancellation', () => {
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks(); });
 
+  it('reports an unacknowledged submission as interrupted and holds backend occupancy', async () => {
+    const project = useProjectStore.getState().project;
+    if (!project) throw new Error('Missing project fixture');
+    const reference = useProjectStore.getState().addTrack('keyboard', 'sample');
+    const clip = useProjectStore.getState().addClip(reference.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+    const bytes = new TextEncoder().encode('canonical-source');
+    const digest = await webcrypto.subtle.digest('SHA-256', bytes);
+    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    const job = { jobId: 'unknown-job', sessionId: 'session', projectId: project.id, captureId: 'capture', bindingId: 'binding', canonicalSha256: hash, modelId: 'base', instrument: 'bass', startFrame: 0, endFrame: 48000, seed: 0, prompt: 'Bass', state: 'queued' };
+    useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: 'fixture', sessionId: 'session', projectId: project.id, executorId: 'executor', captures: [{ captureId: 'capture', canonicalAssetId: 'asset', canonicalSha256: hash, canonicalFrameCount: 48000, tempo: 120, timeSignature: [4, 4] }], bindings: [{ bindingId: 'binding', captureId: 'capture', clipId: clip.id }] });
+    const transitions: unknown[] = [];
+    const uploads: string[] = [];
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      if (url.includes('/assets/')) return new Response(bytes);
+      if (url.endsWith('/result')) uploads.push(url);
+      if (url.endsWith('/transition') && typeof init?.body === 'string') transitions.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ ...job, state: 'dispatched', backendOccupancy: 'unknown' }));
+    });
+    vi.mocked(generateFromExplicitContext).mockResolvedValue({ succeeded: false, cumulativeBlob: null, errorMessage: 'Lost accepted submission response' });
+    await runBridgeJob(job, new AbortController().signal);
+    expect(transitions).toEqual([{ state: 'dispatched' }, { state: 'interrupted', error: 'SUBMISSION_OUTCOME_UNKNOWN: Lost accepted submission response' }]);
+    expect(useGenerationStore.getState().backendOccupancyJobId).toBe('unknown-job');
+    expect(useGenerationStore.getState().tryAcquireGenerationLock()).toBe(false);
+    expect(useProjectStore.getState().project?.tracks.flatMap(track => track.clips).map(item => item.id)).toEqual([clip.id]);
+    expect(uploads).toEqual([]);
+  });
+
   it.each([false, true])('removes canceled job resources while preserving added user clips: %s', async (addUserClip) => {
     const project = useProjectStore.getState().project;
     if (!project) throw new Error('Missing project fixture');
