@@ -9,6 +9,7 @@
  */
 import { WebSocket } from 'ws';
 import { parseCommand, formatResult } from './daw-cli-format';
+import { prepareAudioImport } from './audio-import';
 
 const BRIDGE_URL = process.env.DAW_MCP_BRIDGE_URL ?? 'ws://127.0.0.1:5174/ws/mcp-bridge';
 const TIMEOUT_MS = 5000;
@@ -35,21 +36,24 @@ async function main(): Promise<void> {
   }
 }
 
-function sendToolCall(
+async function sendToolCall(
   id: string,
   tool: string,
   params: Record<string, unknown>,
 ): Promise<unknown> {
+  const requestParams = tool === 'daw_import_audio' ? await prepareAudioImport(params) : params;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       ws.close();
       reject(new Error(`Timeout after ${TIMEOUT_MS}ms — is the DAW dev server running?`));
     }, TIMEOUT_MS);
 
-    const ws = new WebSocket(BRIDGE_URL);
+    const url = new URL(BRIDGE_URL);
+    url.searchParams.set('role', 'agent');
+    const ws = new WebSocket(url);
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ id, tool, params }));
+      ws.send(JSON.stringify({ id, tool, params: requestParams }));
     });
 
     ws.on('message', (data: Buffer) => {

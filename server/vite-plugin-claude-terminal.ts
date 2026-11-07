@@ -34,6 +34,8 @@ interface PtyProcess {
 }
 
 interface SessionState {
+  provider: 'claude' | 'codex';
+  bridgeUrl: string;
   ptyProc: PtyProcess | null;
   ws: WebSocket | null;
   graceTimer: ReturnType<typeof setTimeout> | null;
@@ -91,11 +93,11 @@ function attachPty(session: SessionState, ws: WebSocket, cols: number, rows: num
       // During detection phase, check for "not found" in output
       if (detecting) {
         detectBuffer += data;
-        if (detectBuffer.includes('not found') || detectBuffer.includes('No such file')) {
+        if (detectBuffer.includes(`command not found: ${session.provider}`)) {
           detecting = false;
           // Don't forward the error output — send control message instead
           if (session.ws?.readyState === WebSocket.OPEN) {
-            session.ws.send(JSON.stringify({ type: 'claude-not-found' }));
+            session.ws.send(JSON.stringify({ type: `${session.provider}-not-found` }));
           }
           // Kill the shell — client will handle the fallback UI
           try { session.ptyProc?.kill(); } catch { /* ok */ }
@@ -112,7 +114,11 @@ function attachPty(session: SessionState, ws: WebSocket, cols: number, rows: num
     // Auto-start Claude Code after shell is ready
     setTimeout(() => {
       if (session.ptyProc) {
-        session.ptyProc.write('claude\r');
+        const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+        const command = session.provider === 'codex'
+          ? `codex -c ${quote('mcp_servers.ace-step-daw.command="npx"')} -c ${quote('mcp_servers.ace-step-daw.args=["tsx","server/mcp-server.ts"]')} -c ${quote(`mcp_servers.ace-step-daw.env.DAW_MCP_BRIDGE_URL=${JSON.stringify(session.bridgeUrl)}`)}`
+          : 'claude';
+        session.ptyProc.write(`${command}\r`);
       }
     }, 500);
 
@@ -155,7 +161,8 @@ function installClaude(session: SessionState, ws: WebSocket, cols: number, rows:
     // Run the install command
     setTimeout(() => {
       if (session.ptyProc) {
-        session.ptyProc.write('npm install -g @anthropic-ai/claude-code && exit\r');
+        const packageName = session.provider === 'codex' ? '@openai/codex' : '@anthropic-ai/claude-code';
+        session.ptyProc.write(`npm install -g ${packageName} && exit\r`);
       }
     }, 300);
   } catch (err) {
@@ -165,12 +172,16 @@ function installClaude(session: SessionState, ws: WebSocket, cols: number, rows:
 }
 
 export function claudeTerminalPlugin(): Plugin {
-  const session: SessionState = { ptyProc: null, ws: null, graceTimer: null, cwd: '' };
+  const sessions: SessionState[] = ['claude', 'codex'].map((provider) => ({
+    provider: provider === 'codex' ? 'codex' : 'claude',
+    bridgeUrl: '',
+    ptyProc: null, ws: null, graceTimer: null, cwd: '',
+  }));
 
   return {
     name: 'vite-plugin-claude-terminal',
     configureServer(server: ViteDevServer) {
-      session.cwd = server.config.root;
+      for (const session of sessions) session.cwd = server.config.root;
 
       const wssTerminal = new WebSocketServer({ noServer: true });
       const wssMcpBridge = new WebSocketServer({ noServer: true });
@@ -179,11 +190,11 @@ export function claudeTerminalPlugin(): Plugin {
       server.httpServer?.on(
         'upgrade',
         (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-          if (req.url === '/ws/claude') {
+          if (req.url === '/ws/claude' || req.url === '/ws/codex') {
             wssTerminal.handleUpgrade(req, socket, head, (ws) => {
               wssTerminal.emit('connection', ws, req);
             });
-          } else if (req.url === '/ws/mcp-bridge') {
+          } else if (req.url?.split('?')[0] === '/ws/mcp-bridge') {
             wssMcpBridge.handleUpgrade(req, socket, head, (ws) => {
               wssMcpBridge.emit('connection', ws, req);
             });
@@ -192,7 +203,12 @@ export function claudeTerminalPlugin(): Plugin {
       );
 
       // ── Terminal WebSocket ──
-      wssTerminal.on('connection', (ws: WebSocket) => {
+      wssTerminal.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+        const session = sessions.find((candidate) => req.url === `/ws/${candidate.provider}`);
+        if (!session) { ws.close(); return; }
+        const address = server.httpServer?.address();
+        const port = address && typeof address === 'object' ? address.port : 5174;
+        session.bridgeUrl = `ws://127.0.0.1:${port}/ws/mcp-bridge`;
         // Cancel grace period if reconnecting
         if (session.graceTimer) {
           clearTimeout(session.graceTimer);
@@ -221,7 +237,7 @@ export function claudeTerminalPlugin(): Plugin {
                 return;
               }
 
-              if (msg.type === 'install-claude' && msg.cols && msg.rows) {
+              if (msg.type === `install-${session.provider}` && msg.cols && msg.rows && !session.ptyProc) {
                 installClaude(session, ws, msg.cols, msg.rows);
                 return;
               }
@@ -240,6 +256,7 @@ export function claudeTerminalPlugin(): Plugin {
         });
 
         ws.on('close', () => {
+          if (session.ws !== ws) return;
           session.ws = null;
           session.graceTimer = setTimeout(() => {
             killSession(session);
@@ -248,15 +265,39 @@ export function claudeTerminalPlugin(): Plugin {
       });
 
       // ── MCP Bridge WebSocket ──
-      wssMcpBridge.on('connection', (ws: WebSocket) => {
-        mcpBridgeClients.add(ws);
-        ws.on('close', () => mcpBridgeClients.delete(ws));
+      const agentClients = new Set<WebSocket>();
+      wssMcpBridge.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+        const isAgent = new URL(req.url ?? '/', 'http://localhost').searchParams.get('role') === 'agent';
+        const clients = isAgent ? agentClients : mcpBridgeClients;
+        clients.add(ws);
+        ws.on('message', (data) => {
+          if (isAgent && mcpBridgeClients.size !== 1) {
+            try {
+              const request: unknown = JSON.parse(data.toString());
+              if (request && typeof request === 'object' && 'id' in request) {
+                ws.send(JSON.stringify({ id: request.id, error: mcpBridgeClients.size === 0
+                  ? 'Open the DAW in a browser before using DAW tools.'
+                  : 'Multiple DAW tabs are open. Close the other tabs before using DAW tools.' }));
+              }
+            } catch (error) {
+              if (!(error instanceof SyntaxError)) throw error;
+            }
+            return;
+          }
+          const recipients = isAgent ? mcpBridgeClients : agentClients;
+          for (const client of recipients) {
+            if (client.readyState === WebSocket.OPEN) client.send(data.toString());
+            if (isAgent) break;
+          }
+        });
+        ws.on('close', () => clients.delete(ws));
       });
 
       (server as unknown as Record<string, unknown>).__mcpBridgeClients = mcpBridgeClients;
 
       server.httpServer?.on('close', () => {
-        killSession(session);
+        for (const session of sessions) killSession(session);
+        for (const client of [...mcpBridgeClients, ...agentClients]) client.terminate();
         wssTerminal.close();
         wssMcpBridge.close();
       });

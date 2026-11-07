@@ -265,6 +265,21 @@ async function executeTool(tool: string, params: Record<string, unknown>): Promi
     }
 
     // ── Generation ──
+    case 'daw_import_audio': {
+      if (typeof params.audioBase64 !== 'string' || typeof params.fileName !== 'string') {
+        throw new Error('Use the DAW MCP server or daw import-audio to send a local audio file.');
+      }
+      if (params.startTime !== undefined && (typeof params.startTime !== 'number' || !Number.isFinite(params.startTime) || params.startTime < 0)) {
+        throw new Error('startTime must be a non-negative number of seconds.');
+      }
+      if (params.trackId !== undefined && typeof params.trackId !== 'string') {
+        throw new Error('trackId must be a string.');
+      }
+      const bytes = Uint8Array.from(atob(params.audioBase64), character => character.charCodeAt(0));
+      const file = new File([bytes], params.fileName);
+      const { importAudioFile } = await import('./audioImport');
+      return importAudioFile(file, params.startTime ?? 0, params.trackId);
+    }
     case 'daw_generate': {
       const prompt = params.prompt as string;
       if (!prompt) throw new Error('prompt is required');

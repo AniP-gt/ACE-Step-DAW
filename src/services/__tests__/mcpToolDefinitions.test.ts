@@ -10,9 +10,9 @@ import {
 
 describe('MCP Tool Definitions — Issue #1337', () => {
   describe('Tool registry', () => {
-    it('contains 18 tool definitions', () => {
+    it('contains 19 tool definitions', () => {
       const tools = getAllToolDefinitions();
-      expect(tools.length).toBe(18);
+      expect(tools.length).toBe(19);
     });
 
     it('all tools have a daw_ prefix', () => {

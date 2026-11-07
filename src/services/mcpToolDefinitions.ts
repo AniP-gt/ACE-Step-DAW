@@ -283,6 +283,20 @@ const daw_show_mixer: McpToolDefinition = {
 
 /** All available MCP tools, keyed by tool name. */
 export const MCP_TOOL_DEFINITIONS: Record<string, McpToolDefinition> = {
+  daw_import_audio: {
+    name: 'daw_import_audio',
+    description: 'Import a local audio file into the DAW as a ready timeline clip. Use after generating audio outside the DAW generation pipeline.',
+    category: 'write',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Local audio file path, at most 64 MiB.' },
+        trackId: { type: 'string', description: 'Optional existing target track ID.' },
+        startTime: { type: 'number', description: 'Start position in seconds.', minimum: 0, default: 0 },
+      },
+      required: ['path'],
+    },
+  },
   daw_get_project,
   daw_get_tracks,
   daw_get_transport,

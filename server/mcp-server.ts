@@ -12,6 +12,9 @@
  */
 
 import { WebSocket } from 'ws';
+import { randomUUID } from 'node:crypto';
+import { createInterface } from 'node:readline';
+import { prepareAudioImport } from './audio-import';
 
 const BRIDGE_URL = process.env.DAW_MCP_BRIDGE_URL ?? 'ws://127.0.0.1:5174/ws/mcp-bridge';
 
@@ -44,6 +47,19 @@ interface MCPToolDefinition {
 // ── Tool Definitions ──
 
 const TOOLS: MCPToolDefinition[] = [
+  {
+    name: 'daw_import_audio',
+    description: 'Import a generated or existing local audio file into the DAW timeline. After generating audio outside daw_generate, use this tool to place the file in the project before reporting completion. Returns the ready clip ID, track ID, and duration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Local audio file path (WAV, MP3, FLAC, OGG, OPUS, M4A, AAC, AIFF), at most 64 MiB.' },
+        trackId: { type: 'string', description: 'Optional existing target track. Omit to create a sample track.' },
+        startTime: { type: 'number', description: 'Timeline start in seconds, default 0.' },
+      },
+      required: ['path'],
+    },
+  },
   // Read
   {
     name: 'daw_get_project',
@@ -238,7 +254,9 @@ function connectBridge(): Promise<void> {
 
   return new Promise((resolve, reject) => {
     try {
-      bridgeWs = new WebSocket(BRIDGE_URL);
+      const url = new URL(BRIDGE_URL);
+      url.searchParams.set('role', 'agent');
+      bridgeWs = new WebSocket(url);
     } catch (err) {
       scheduleReconnect();
       reject(err);
@@ -280,17 +298,16 @@ function connectBridge(): Promise<void> {
   });
 }
 
-let callIdCounter = 0;
-
 async function callBridge(tool: string, params: Record<string, unknown>): Promise<unknown> {
+  const requestParams = tool === 'daw_import_audio' ? await prepareAudioImport(params) : params;
   if (!bridgeWs || bridgeWs.readyState !== WebSocket.OPEN) {
     await connectBridge();
   }
 
-  const id = `mcp-${++callIdCounter}`;
+  const id = randomUUID();
   return new Promise((resolve, reject) => {
     pendingCalls.set(id, { resolve, reject });
-    bridgeWs!.send(JSON.stringify({ id, tool, params }));
+    bridgeWs!.send(JSON.stringify({ id, tool, params: requestParams }));
 
     // Timeout after 10s
     setTimeout(() => {
@@ -306,11 +323,12 @@ async function callBridge(tool: string, params: Record<string, unknown>): Promis
 
 function sendResponse(response: MCPResponse) {
   const json = JSON.stringify(response);
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`);
+  process.stdout.write(`${json}\n`);
 }
 
 async function handleRequest(request: MCPRequest) {
   const { id, method, params } = request;
+  if (method.startsWith('notifications/')) return;
 
   switch (method) {
     case 'initialize':
@@ -375,38 +393,20 @@ async function handleRequest(request: MCPRequest) {
 
 // ── stdio Reader ──
 
-let buffer = '';
-
-process.stdin.setEncoding('utf-8');
-process.stdin.on('data', (chunk: string) => {
-  buffer += chunk;
-
-  while (true) {
-    const headerEnd = buffer.indexOf('\r\n\r\n');
-    if (headerEnd === -1) break;
-
-    const header = buffer.slice(0, headerEnd);
-    const contentLengthMatch = header.match(/Content-Length:\s*(\d+)/i);
-    if (!contentLengthMatch) {
-      buffer = buffer.slice(headerEnd + 4);
-      continue;
-    }
-
-    const contentLength = parseInt(contentLengthMatch[1], 10);
-    const bodyStart = headerEnd + 4;
-
-    if (buffer.length < bodyStart + contentLength) break;
-
-    const body = buffer.slice(bodyStart, bodyStart + contentLength);
-    buffer = buffer.slice(bodyStart + contentLength);
-
-    try {
-      const request = JSON.parse(body) as MCPRequest;
-      void handleRequest(request);
-    } catch {
-      // ignore parse errors
-    }
+const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on('line', (line) => {
+  try {
+    const request = JSON.parse(line) as MCPRequest;
+    void handleRequest(request);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    process.stderr.write('[DAW MCP Server] Invalid JSON request.\n');
   }
+});
+input.on('close', () => {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  bridgeWs?.removeAllListeners('close');
+  bridgeWs?.close();
 });
 
 // Connect to browser bridge on startup

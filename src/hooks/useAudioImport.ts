@@ -9,6 +9,7 @@ import { parseMidiFile } from '../utils/midi';
 import { toastError, toastInfo, toastSuccess } from './useToast';
 import { LOOP_DEFINITIONS, loadLoop } from '../engine/LoopLibrary';
 import { createDebugLogger } from '../utils/debugLogger';
+import { importAudioFile as importAudioFileToProject } from '../services/audioImport';
 
 const log = createDebugLogger('audio-import');
 
@@ -128,53 +129,11 @@ export function useAudioImport() {
   }, [addClip, updateClipStatus]);
 
   const importAudioFile = useCallback(async (file: File, startTime: number = 0) => {
-    const project = useProjectStore.getState().project;
-    if (!project) return;
-
-    const engine = getAudioEngine();
-    await engine.resume();
-
-    // Decode the audio file
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await engine.ctx.decodeAudioData(arrayBuffer);
-    const duration = audioBuffer.duration;
-
-    const track = addTrack('custom', 'sample');
-    // Rename to the file name
-    useProjectStore.getState().updateTrack(track.id, {
-      displayName: file.name.replace(/\.[^.]+$/, ''),
-    });
-
-    // Create a clip spanning the audio at the specified position
-    const clipDuration = Math.min(duration, project.totalDuration - startTime);
-    if (clipDuration <= 0) return;
-    const clip = addClip(track.id, {
-      startTime,
-      duration: clipDuration,
-      prompt: `Imported: ${file.name}`,
-      lyrics: '',
-    });
-
-    const trimmedBuffer = trimAudioBuffer(engine, audioBuffer, clipDuration);
-
-    // Convert to WAV and store
-    const wavBlob = audioBufferToWavBlob(trimmedBuffer);
-    const isolatedKey = await saveAudioBlob(project.id, clip.id, 'isolated', wavBlob);
-
-    // Compute waveform peaks with mipmap
-    const peaks = await computeWaveformWithMipmap(isolatedKey, trimmedBuffer);
-
-    // Mark clip as ready with uploaded source
-    updateClipStatus(clip.id, 'ready', {
-      isolatedAudioKey: isolatedKey,
-      waveformPeaks: peaks,
-      audioDuration: clipDuration,
-      audioOffset: 0,
-      source: 'uploaded',
-    });
-
+    if (!useProjectStore.getState().project) return;
+    await getAudioEngine().resume();
+    await importAudioFileToProject(file, startTime);
     toastSuccess('Audio file imported');
-  }, [addTrack, addClip, updateClipStatus]);
+  }, []);
 
   const importAudioToTrack = useCallback(async (file: File, trackId: string, startTime: number) => {
     const project = useProjectStore.getState().project;

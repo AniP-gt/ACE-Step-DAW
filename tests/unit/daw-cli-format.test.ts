@@ -11,6 +11,13 @@ import {
 
 describe('daw-cli-format', () => {
   describe('parseCommand', () => {
+    it('routes a local audio file and optional target to audio import', () => {
+      expect(parseCommand(['import-audio', '/tmp/strings phrase.wav', 'track-1', '4'])).toEqual({
+        tool: 'daw_import_audio', params: { path: '/tmp/strings phrase.wav', trackId: 'track-1', startTime: 4 },
+      });
+      expect(parseCommand(['import-audio'])).toHaveProperty('error');
+      expect(parseCommand(['import-audio', '/tmp/a.wav', 'track-1', '-1'])).toHaveProperty('error');
+    });
     it('parses status command', () => {
       expect(parseCommand(['status'])).toEqual({
         tool: 'daw_get_project',

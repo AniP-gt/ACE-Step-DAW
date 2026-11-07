@@ -71,6 +71,17 @@ export function parseCommand(args: string[]): ParsedCommand | { error: string } 
       if (!prompt) return { error: 'Usage: daw generate <trackId> <prompt>' };
       return { tool: 'daw_generate', params: { trackId, prompt } };
     }
+    case 'import-audio': {
+      const startTime = Number(rest[2] ?? 0);
+      if (!rest[0] || !Number.isFinite(startTime) || startTime < 0) {
+        return { error: 'Usage: daw import-audio <path> [trackId] [startTimeSeconds]' };
+      }
+      return { tool: 'daw_import_audio', params: {
+        path: rest[0],
+        ...(rest[1] ? { trackId: rest[1] } : {}),
+        startTime,
+      } };
+    }
     case 'midi': {
       if (rest.length < 4)
         return { error: 'Usage: daw midi <clipId> <pitch> <start> <dur> [vel]' };
@@ -99,7 +110,7 @@ export function parseCommand(args: string[]): ParsedCommand | { error: string } 
     }
     default:
       return {
-        error: `Unknown command: ${cmd ?? '(none)'}\nCommands: status tracks transport mix play stop loop set-bpm add-track delete-track volume pan mute solo generate midi step`,
+        error: `Unknown command: ${cmd ?? '(none)'}\nCommands: status tracks transport mix play stop loop set-bpm add-track delete-track volume pan mute solo generate import-audio midi step`,
       };
   }
 }

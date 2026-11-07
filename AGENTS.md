@@ -104,6 +104,12 @@ git checkout -b feat/v0.0.X-feature-name
 
 ## User Story Driven Development
 
+### Embedded DAW Music Requests
+
+- When a user requests music from the embedded assistant, deliver it in the active DAW project. A file saved elsewhere is not a completed DAW result.
+- Prefer `daw_generate` for generation through the DAW pipeline. If generating through a direct API or external tool, import the resulting file with `daw_import_audio` or `npx tsx server/daw-cli.ts import-audio <path> [trackId] [startTimeSeconds]`.
+- Verify the returned clip ID, ready status and audio asset in the current project before reporting that the music is available in the DAW. Do not substitute external playback or documentation updates for timeline placement.
+
 ### Format
 ```
 As a [human user / AI agent], I want to [action], so that [outcome].
