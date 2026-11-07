@@ -65,6 +65,10 @@ export function LogicBridgePanel() {
         </form>}
         <ul className="space-y-2">{state.jobs.map(job => <li key={stringField(job, 'jobId')} className="flex flex-wrap items-center gap-2 text-sm">
           <span>{stringField(job, 'instrument')} · {stringField(job, 'state')}</span>
+          {job.state === 'ready' && typeof job.resultId === 'string' && job.resultId && <div className="w-full min-w-0 space-y-1">
+            <label className="flex flex-col gap-1">Result UUID<input className={`${control} w-full max-w-md font-mono`} readOnly value={job.resultId} onFocus={event => event.currentTarget.select()} /></label>
+            <p>Copy this UUID into Result UUID in the Logic Bridge AU, then click Fetch result.</p>
+          </div>}
           {['queued', 'dispatched', 'running', 'exporting'].includes(String(job.state)) && <button className={control} onClick={() => void perform(async () => { if (state.token) await bridgeJson(state.token, `/jobs/${encodeURIComponent(stringField(job, 'jobId'))}/cancel`, {}); })}>Cancel layer</button>}
         </li>)}</ul>
       </>}

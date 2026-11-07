@@ -19,7 +19,7 @@ describe('Logic Bridge panel', () => {
   it('reports a rejected pairing and restores the connection control', async () => {
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ error: { code: 'INVALID_PAIRING', message: 'Pairing code invalid or expired', requestId: 'internal-request' } }), { status: 401 }));
     render(<LogicBridgePanel />);
-    fireEvent.click(screen.getByText(/Logic Bridge/));
+    fireEvent.click(screen.getByText(/^Logic Bridge ·/));
     fireEvent.change(screen.getByLabelText('Pairing code'), { target: { value: 'expired' } });
     fireEvent.click(screen.getByRole('button', { name: 'Connect' }));
     await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('Pairing code invalid or expired'));
@@ -31,8 +31,30 @@ describe('Logic Bridge panel', () => {
     const projectId = useProjectStore.getState().project?.id;
     useLogicBridgeStore.setState({ connected: true, selectedCaptureId: 'capture', captures: [{ captureId: 'capture', label: 'Piano', state: 'ready', canonicalFrameCount: 96000, tempo: 120, timeSignature: [4, 4], hostStartSample: 48000, sampleRate: 48000 }], bindings: [{ captureId: 'capture', bindingId: 'binding', projectId }] });
     render(<LogicBridgePanel />);
-    fireEvent.click(screen.getByText(/Logic Bridge/));
+    fireEvent.click(screen.getByText(/^Logic Bridge ·/));
     expect(screen.getByRole('button', { name: 'Add layer' })).toBeDisabled();
     expect(screen.getByLabelText('End (seconds)')).toHaveValue(2);
+  });
+
+  it('exposes only available ready result UUIDs for selection without exposing credentials', () => {
+    const resultId = '11223344-5566-4788-99aa-bbccddeeff00';
+    useLogicBridgeStore.setState({ connected: true, token: 'private-executor-token', executorId: 'private-executor-id', jobs: [
+      { jobId: 'completed-job', instrument: 'bass', state: 'ready', resultId },
+      { jobId: 'running-job', instrument: 'drums', state: 'running', resultId: 'unfinished-result' },
+      { jobId: 'missing-result-job', instrument: 'piano', state: 'ready' },
+    ] });
+    const { container } = render(<LogicBridgePanel />);
+    fireEvent.click(screen.getByText(/^Logic Bridge ·/));
+
+    const result = screen.getByRole<HTMLInputElement>('textbox', { name: 'Result UUID' });
+    expect(result).toHaveValue(resultId);
+    expect(result).toHaveAttribute('readonly');
+    expect(screen.getAllByRole('textbox')).toHaveLength(1);
+    fireEvent.focus(result);
+    expect(result.selectionStart).toBe(0);
+    expect(result.selectionEnd).toBe(resultId.length);
+    expect(container.innerHTML).not.toContain('private-executor-token');
+    expect(container.innerHTML).not.toContain('private-executor-id');
+    expect(container.innerHTML).not.toContain('unfinished-result');
   });
 });
