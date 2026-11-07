@@ -43,6 +43,8 @@ All tools are also available through `npx tsx server/daw-cli.ts logic <tool> '<J
 
 For keyboard-based return, create a new Logic audio track, use File > Import > Audio File, and select the exported WAV shown by Reveal in Finder. Import it at the suggested position. File > Project Management > Consolidate with audio-file copying enabled makes the project independent from the bridge's export folder. Logic can append metadata to an imported WAV; the current native implementation therefore keeps its verified original separately in `~/Library/ACE-Step Bridge/native-results/verified-cache/` and hands out writable copies. Offline restoration validates the original and makes a fresh copy without overwriting earlier exported files.
 
+The Logic Bridge panel exposes a selectable read-only `Result UUID` for each ready job with a result. Copy it into the AU's `Result UUID` field and click `Fetch result`; MCP `logic_export_result` is an alternative. Explicit-context source uploads preserve canonical WAV bytes instead of applying the ordinary upload downsampling optimization.
+
 ## Build and verification
 
 See `plugins/logic-bridge/README.md` for native build and fixture instructions and `server/logic-bridge/README.md` for the exact service contract and operational limitations. The native build does not automatically install a component into the user's system. Installation/rescan and real Logic capture/drag/reopen must be verified separately.
