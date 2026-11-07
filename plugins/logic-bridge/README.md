@@ -14,6 +14,17 @@ Start the independent bridge service on `127.0.0.1:5176`. Create a native-role p
 
 The render thread only reads host position and copies into a preallocated 262,144-frame SPSC ring. The worker drains into a bounded-duration PCM buffer, then uploads chunks no larger than 1 MiB and finalizes through the service. This implementation deliberately uploads after capture to isolate collection from network stalls. A suspended host triggers an inactivity warning and cancellation; processing must resume to acknowledge cancellation before another take. Captured is shown only after the service returns canonical readiness. The service must be available when uploading; partial network uploads are canceled on failure.
 
-Paste a returned result UUID and choose Fetch result. The worker verifies the asset SHA-256 and WAV decoding before enabling Drag WAV and Reveal in Finder. WAV and JSON placement metadata are saved under `~/Library/Application Support/ACE-Step Bridge/native-results/`. Dragging does not create or position a Logic track automatically.
+Paste a returned result UUID and choose Fetch result. The worker verifies the asset SHA-256 and WAV decoding before enabling Drag WAV and Reveal in Finder. WAV and JSON placement metadata are saved under `~/Library/ACE-Step Bridge/native-results/`. Dragging does not create or position a Logic track automatically.
 
-Development limitations: no result subscription/list yet; manual UUID lookup is required. AU state retains the paired session identifier for display, capture length and last result reference; credentials remain runtime-only. No release or Logic compatibility claim follows from unit tests or a successful local build.
+Development limitations: no result subscription/list yet; manual UUID lookup is required. AU state retains the paired session identifier for display, capture length, last result reference and a safe cached WAV basename; credentials remain runtime-only. On reopen the background worker verifies the local WAV and matching sidecar without network access, then enables Drag WAV and Reveal in Finder. Missing or corrupt files disable file return and show a re-pair/refetch recovery message. No release or Logic compatibility claim follows from unit tests or a successful local build.
+
+### Native cache race regression
+
+Stop the development bridge service through its owner before running the following tests; the fixture requires exclusive loopback port 5176 and never terminates existing processes. Restart the service afterward.
+
+```sh
+python3 plugins/logic-bridge/tests/cache_race_probe.py plugins/logic-bridge/build/processor_probe_artefacts/Debug/processor_probe
+python3 plugins/logic-bridge/tests/cache_race_probe.py plugins/logic-bridge/build/processor_probe_artefacts/Debug/processor_probe --pair-race
+```
+
+The fixture delays a real HTTP result or pairing response, restores another cached AU state before releasing it, and verifies that the late response cannot replace the restored selection or credentials. Loading host state clears runtime credentials on the worker and requires explicit re-pairing for subsequent captures. Cached files remain available offline.
