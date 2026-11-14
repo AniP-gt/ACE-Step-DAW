@@ -72,3 +72,20 @@ export interface BridgeResult {
   readonly frameCount: number;
   readonly placementSeconds: number;
 }
+
+/** Metadata exposed by the session-scoped result catalog. */
+export interface BridgeResultSummary {
+  readonly resultId: string;
+  readonly jobId: string;
+  /** Display label truncated to at most 128 Unicode code points. */
+  readonly instrument: string;
+  readonly frameCount: number;
+  readonly placementSeconds: number;
+  /** One-based position in the session's persisted results before ready filtering. */
+  readonly publicationOrder: number;
+}
+export interface BridgeResultPage {
+  readonly sessionId: string;
+  readonly results: readonly BridgeResultSummary[];
+  readonly nextBeforeResultId: string | null;
+}

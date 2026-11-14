@@ -272,3 +272,84 @@ it('rejects no-submission acknowledgments from non-executors or after a task rec
   expect(await json(await api(service, context.executor.token, path))).toMatchObject({ state: 'running', backendOccupancy: 'occupied', backendTaskId: 'accepted-task' });
   expect((await api(service, context.executor.token, '/jobs', { ...context.parameters, clientRequestId: 'blocked' })).status).toBe(409);
 });
+
+it('lists scoped ready results with stable bounded cursors and publication order across restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'logic-catalog-')); cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const first = await createBridgeService({ root, port: 0 }); cleanup.push(() => first.close());
+  const native = await paired(first); const foreign = await paired(first);
+  const executor = await paired(first, 'executor', native.sessionId); const mcp = await paired(first, 'mcp', native.sessionId);
+  await first.close();
+  const statePath = join(root, 'state.json');
+  const state = JSON.parse(await readFile(statePath, 'utf8')) as import('../../server/logic-bridge/storage').BridgeState;
+  const add = (n: number, sessionId = native.sessionId, assetId = 'good') => {
+    const resultId = `result-${sessionId}-${n}`; const jobId = `job-${sessionId}-${n}`;
+    state.results.push({ resultId, sessionId, jobId, assetId, sha256: checksum(Buffer.from('valid')), frameCount: 48000 + n, placementSeconds: -n });
+    state.jobs.push({ jobId, sessionId, projectId: 'project-a', captureId: 'capture', bindingId: 'binding', clientRequestId: jobId, canonicalSha256: 'hash', startFrame: 0, endFrame: 48000, instrument: n === 105 ? '\u0000'.repeat(130) : '🎹'.repeat(130), prompt: 'private prompt', modelId: 'model', seed: 0, state: 'ready', parameterHash: 'hash', resultId });
+    return resultId;
+  };
+  await writeFile(join(root, 'assets', 'good'), 'valid'); await writeFile(join(root, 'assets', 'bad'), 'valid');
+  state.assets.push(...['good', 'bad'].map(assetId => ({ assetId, sessionId: native.sessionId, sha256: checksum(Buffer.from('valid')), size: 5 })));
+  for (let n = 1; n <= 105; n++) { add(n, native.sessionId, n === 50 ? 'bad' : 'good'); if (n === 30) add(1, foreign.sessionId); }
+  // Invalid joins are not ready and still consume session positions.
+  const missing = add(106); state.jobs.pop();
+  const mismatch = add(107); state.jobs[state.jobs.length - 1] = { ...state.jobs[state.jobs.length - 1], sessionId: foreign.sessionId };
+  await writeFile(statePath, JSON.stringify(state));
+  const second = await createBridgeService({ root, port: 0 }); cleanup.push(() => second.close());
+  const path = `/results?sessionId=${native.sessionId}`;
+  for (const token of [native.token, executor.token, mcp.token, second.controlToken]) expect((await api(second, token, path)).status).toBe(200);
+  expect((await fetch(`${second.url}${path}`)).status).toBe(401);
+  expect((await api(second, foreign.token, path)).status).toBe(403);
+  expect((await api(second, native.token, '/results')).status).toBe(403);
+  expect(await json(await api(second, foreign.token, `/results?sessionId=${foreign.sessionId}&beforeResultId=result-${foreign.sessionId}-1`))).toEqual({ sessionId: foreign.sessionId, results: [], nextBeforeResultId: null });
+  for (const value of ['', '0', '101', '1.0', '-1', '2e0', 'abc', ' 1']) expect((await api(second, native.token, `${path}&limit=${encodeURIComponent(value)}`)).status).toBe(400);
+  const errors = [];
+  for (const cursor of ['absent', `result-${foreign.sessionId}-1`, missing, mismatch]) {
+    const response = await api(second, native.token, `${path}&beforeResultId=${cursor}`); expect(response.status).toBe(400);
+    const problem = await json(response); errors.push((problem.error as { code: string }).code);
+  }
+  expect(new Set(errors).size).toBe(1);
+  const page1 = await json(await api(second, native.token, path));
+  const rows1 = page1.results as { resultId: string; publicationOrder: number; instrument: string }[];
+  expect(rows1).toHaveLength(50); expect(rows1[0].publicationOrder).toBe(105);
+  expect(Object.keys(page1).sort()).toEqual(['nextBeforeResultId', 'results', 'sessionId']);
+  expect(Object.keys(rows1[0]).sort()).toEqual(['frameCount', 'instrument', 'jobId', 'placementSeconds', 'publicationOrder', 'resultId']);
+  expect(rows1[0].instrument).toBe('\u0000'.repeat(128)); expect(rows1[1].instrument).toBe('🎹'.repeat(128));
+  const maxResponse = await api(second, native.token, `${path}&limit=100`); const maxBody = await maxResponse.text();
+  expect((JSON.parse(maxBody) as { results: unknown[] }).results).toHaveLength(100); expect(Buffer.byteLength(maxBody)).toBeLessThanOrEqual(256 * 1024);
+  await second.close();
+  // Add a newer result and make an older ready asset unavailable across restart.
+  add(108); await writeFile(statePath, JSON.stringify(state)); await writeFile(join(root, 'assets', 'bad'), 'corrupt');
+  const third = await createBridgeService({ root, port: 0 }); cleanup.push(() => third.close());
+  const page2 = await json(await api(third, native.token, `${path}&beforeResultId=${page1.nextBeforeResultId}`));
+  const rows2 = page2.results as { resultId: string; publicationOrder: number }[];
+  expect(rows2).toHaveLength(50); expect(rows2[0].publicationOrder).toBe(55);
+  const page3 = await json(await api(third, native.token, `${path}&beforeResultId=${page2.nextBeforeResultId}`));
+  const rows3 = page3.results as { resultId: string; publicationOrder: number }[];
+  expect(rows3.map(row => row.publicationOrder)).toEqual([4, 3, 2, 1]); expect(page3.nextBeforeResultId).toBeNull();
+  expect([...rows2, ...rows3].some(row => row.publicationOrder === 50)).toBe(false);
+  const latest = await json(await api(third, native.token, path));
+  expect((latest.results as { publicationOrder: number }[])[0].publicationOrder).toBe(108);
+  expect((await api(third, native.token, `${path}&beforeResultId=result-${native.sessionId}-50`)).status).toBe(400);
+});
+
+it('keeps a result cursor stable when a new result is published between live page requests', async () => {
+  const service = await fixture(); const context = await bound(service);
+  const source = Buffer.from(await (await api(service, context.token, `/assets/${context.capture.canonicalAssetId}`)).arrayBuffer());
+  const output = Buffer.from(source.subarray(0, 44 + 24000 * 8)); output.writeUInt32LE(output.length - 8, 4); output.writeUInt32LE(output.length - 44, 40);
+  async function publish(n: number) {
+    const job = await json(await api(service, context.executor.token, '/jobs', { ...context.parameters, clientRequestId: `page-job-${n}` }));
+    for (const state of ['dispatched', 'running', 'exporting']) expect((await api(service, context.executor.token, `/jobs/${job.jobId}/transition`, { state })).status).toBe(200);
+    const result = await fetch(`${service.url}/jobs/${job.jobId}/result`, { method: 'POST', headers: { Authorization: `Bearer ${context.executor.token}`, 'X-Bridge-Protocol': '1', 'X-Executor-Id': 'executor-a' }, body: output });
+    expect(result.status).toBe(200); return String((await json(result)).resultId);
+  }
+  const oldest = await publish(1); const cursor = await publish(2);
+  const path = `/results?sessionId=${context.sessionId}&limit=1`;
+  const first = await json(await api(service, context.token, path));
+  expect(first.nextBeforeResultId).toBe(cursor);
+  const newest = await publish(3);
+  const next = await json(await api(service, context.token, `${path}&beforeResultId=${cursor}`));
+  expect((next.results as { resultId: string }[]).map(row => row.resultId)).toEqual([oldest]);
+  expect(next.nextBeforeResultId).toBeNull();
+  const latest = await json(await api(service, context.token, path));
+  expect((latest.results as { resultId: string }[])[0].resultId).toBe(newest);
+});

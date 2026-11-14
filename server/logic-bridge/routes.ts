@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { BridgeCredential, BridgeRole } from '../../shared/logic-bridge/types';
+import type { BridgeCredential, BridgeResultSummary, BridgeRole } from '../../shared/logic-bridge/types';
 import type { storage } from './storage';
 import { check, object, string } from './validation';
 import { appendChunk, createCapture, finalize, reservedCaptureBytes } from './captures';
@@ -161,6 +161,29 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
         updated = { ...job, state: 'ready', resultId, backendOccupancy: 'released' };
       } else check(false, 'NOT_FOUND', 'Route missing', 404);
       db.state.jobs = db.state.jobs.map(item => item.jobId === id ? updated : item); return updated;
+    }
+    if (resource === 'results' && !id && method === 'GET') {
+      const sessionId = url.searchParams.get('sessionId') ?? ''; scope(sessionId);
+      const limitValue = url.searchParams.get('limit');
+      check(limitValue === null || (/^\d+$/.test(limitValue) && Number.isSafeInteger(Number(limitValue)) && Number(limitValue) >= 1 && Number(limitValue) <= 100), 'INVALID_LIMIT', 'Limit must be an integer from 1 to 100');
+      const limit = limitValue === null ? 50 : Number(limitValue);
+      const jobs = new Map(db.state.jobs.filter(job => job.sessionId === sessionId && job.state === 'ready').map(job => [job.jobId, job]));
+      const summaries: BridgeResultSummary[] = [];
+      let publicationOrder = 0;
+      for (const result of db.state.results) {
+        if (result.sessionId !== sessionId) continue;
+        publicationOrder++;
+        const job = jobs.get(result.jobId);
+        if (!job || job.resultId !== result.resultId) continue;
+        summaries.push({ resultId: result.resultId, jobId: result.jobId, instrument: Array.from(job.instrument).slice(0, 128).join(''), frameCount: result.frameCount, placementSeconds: result.placementSeconds, publicationOrder });
+      }
+      summaries.reverse();
+      const before = url.searchParams.get('beforeResultId');
+      const cursorIndex = before === null ? -1 : summaries.findIndex(result => result.resultId === before);
+      check(before === null || cursorIndex !== -1, 'INVALID_CURSOR', 'Invalid result cursor');
+      const start = cursorIndex + 1;
+      const results = summaries.slice(start, start + limit);
+      return { sessionId, results, nextBeforeResultId: start + results.length < summaries.length ? results[results.length - 1].resultId : null };
     }
     if (resource === 'results' && method === 'GET') {
       const result = db.state.results.find(item => item.resultId === id); check(result, 'NOT_FOUND', 'Result missing', 404); scope(result.sessionId); return result;
