@@ -2,7 +2,12 @@
 #include <juce_cryptography/juce_cryptography.h>
 #include <iostream>
 #include <cstring>
+#if JUCE_MAC
+#include <pthread/qos.h>
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 #include "../src/ResultDragButton.h"
+#include "../src/ResultCatalogView.h"
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter();
 class Playhead final:public juce::AudioPlayHead {
 public:
@@ -14,6 +19,11 @@ juce::String bridgeProbeStatus(juce::AudioProcessor&);
 juce::File bridgeProbeResult(juce::AudioProcessor&);
 unsigned bridgeProbeNetworkRequests(juce::AudioProcessor&);
 juce::String bridgeProbePlacement(juce::AudioProcessor&);
+void bridgeProbeCatalogVisible(juce::AudioProcessor&,bool);
+juce::String bridgeProbeCatalog(juce::AudioProcessor&);
+void bridgeProbeCatalogRefresh(juce::AudioProcessor&);
+int bridgeProbeCatalogQos(juce::AudioProcessor&);
+void bridgeProbeEditorTick(juce::AudioProcessorEditor&);
 static bool restoreCache(const juce::File& file,const juce::String& resultId,bool expectReady,const juce::String& overrideName={},const juce::String& expectedPlacement="Suggested start: +0.000000 s") {
  struct OwnedPairs {std::vector<juce::File> files;~OwnedPairs(){for(const auto& owned:files){owned.deleteFile();owned.withFileExtension("json").deleteFile();}}} cleanup;
  auto* settings=new juce::DynamicObject();settings->setProperty("stateId","offline-fixture");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",resultId);settings->setProperty("cachedFilename",overrideName.isEmpty()?file.getFileName():overrideName);
@@ -85,6 +95,118 @@ int main(int argc,char** argv) {
  std::unique_ptr<juce::AudioProcessor> p(createPluginFilter());Playhead head;p->setPlayHead(&head);p->prepareToPlay(48000,512);
  juce::AudioBuffer<float> audio(2,512);juce::MidiBuffer midi;
  for(int b=0;b<1000;++b) {for(int c=0;c<2;++c)for(int i=0;i<512;++i)audio.setSample(c,i,static_cast<float>((b+i+c)%101)/101.0f);juce::AudioBuffer<float> before;before.makeCopyOf(audio);p->processBlock(audio,midi);for(int c=0;c<2;++c)if(std::memcmp(audio.getReadPointer(c),before.getReadPointer(c),512*sizeof(float))!=0)return 1;head.frame+=512;}
+ if(argc==3 && juce::String(argv[1])=="--startup-cancel") {
+#if JUCE_MAC
+  juce::File gate(argv[2]);bridgeProbeCommand(*p,"pair","startup-cancel");
+  for(int i=0;i<400 && bridgeProbeStatus(*p)!="Ready";++i)juce::Thread::sleep(10);
+  if(bridgeProbeStatus(*p)!="Ready"){std::cerr<<"FAIL pairing "<<bridgeProbeStatus(*p)<<"\n";return 110;}
+  setenv("ACE_STARTUP_CANCEL_GATE",gate.getFullPathName().toRawUTF8(),1);bridgeProbeCatalogVisible(*p,true);
+  auto waitFile=[&](const char* name,int ms){for(int i=0;i<ms/5;++i){if(gate.getChildFile(name).existsAsFile())return true;juce::Thread::sleep(5);}return false;};
+  if(!waitFile("entered",4000)){std::cerr<<"FAIL no startup gate\n";gate.getChildFile("release").replaceWithText("release");return 111;}
+  auto start=juce::Time::getMillisecondCounterHiRes();std::atomic<bool> done{false};std::thread destroyer([&]{p.reset();done=true;});
+  if(!waitFile("cancel",2000)){gate.getChildFile("release").replaceWithText("release");destroyer.join();std::cerr<<"FAIL no cancellation marker\n";return 112;}
+  auto released=juce::Time::getMillisecondCounterHiRes();gate.getChildFile("release").replaceWithText("release");destroyer.join();auto ended=juce::Time::getMillisecondCounterHiRes();
+  auto cancelLog=gate.getChildFile("cancel").loadFileAsString();juce::Thread::sleep(100);auto after=gate.getChildFile("cancel").loadFileAsString();unsetenv("ACE_STARTUP_CANCEL_GATE");
+  juce::StringArray events;events.addLines(cancelLog);events.removeEmptyStrings();
+  std::cout<<"startup stop-to-release "<<(released-start)<<" ms; release-to-join "<<(ended-released)<<" ms; stop-to-join "<<(ended-start)<<" ms; cancel count "<<events.size()<<"; post-finish stable "<<(after==cancelLog)<<"\ncancel timestamps (ms):\n"<<cancelLog<<std::flush;
+  if(after!=cancelLog){std::cerr<<"FAIL cancellation after completion\n";return 115;}
+  if(!done || ended-released>=1000){std::cerr<<"FAIL startup cancellation exceeded 1000 ms\n";return 113;}return 0;
+#else
+  return 114;
+#endif
+ }
+ if(argc==2 && juce::String(argv[1])=="--busy-view") {
+  ResultCatalogView view;ResultCatalogState::Page page;page.results.push_back({"one","job","Piano",48000,0,1});view.update(page,true,false,true,false,false,5,true);
+  juce::ListBox* list=nullptr;juce::Button* fetch=nullptr;for(auto* child:view.getChildren()){if(child->getName()=="Results")list=dynamic_cast<juce::ListBox*>(child);if(child->getName()=="Fetch selected")fetch=dynamic_cast<juce::Button*>(child);}
+  int calls=0;view.fetch=[&](const juce::String&){++calls;};if(!list || !fetch || fetch->isEnabled())return 90;list->selectRow(0);if(fetch->isEnabled()){std::cerr<<"FAIL busy row re-enabled Fetch\n";return 91;}if(fetch->onClick)fetch->onClick();if(calls)return 97;view.update(page,false,false,true,false,false,5,false);if(fetch->onClick)fetch->onClick();if(calls)return 98;view.update(page,true,false,true,false,false,5,false);if(!fetch->isEnabled())return 99;if(fetch->onClick)fetch->onClick();return calls==1?0:100;
+ }
+ if(argc==4 && juce::String(argv[1])=="--ui") {
+  juce::File directory(argv[2]);const juce::String selectedId(argv[3]);directory.createDirectory();std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());juce::Component holder;holder.addAndMakeVisible(*editor);holder.setSize(440,360);holder.addToDesktop(0);holder.setVisible(true);
+  auto find=[&](auto&& self,juce::Component& c,const juce::String& name)->juce::Component* {if(c.getName()==name)return &c;for(auto* child:c.getChildren())if(auto* found=self(self,*child,name))return found;return nullptr;};
+  auto click=[&](const juce::String& name){auto* button=dynamic_cast<juce::Button*>(find(find,*editor,name));if(!button || !button->isEnabled())return false;if(button->onClick)button->onClick();return true;};
+  auto tick=[&]{bridgeProbeEditorTick(*editor);};
+  auto capture=[&](const juce::String& state,bool end=false){for(auto size:{juce::Point<int>{440,360},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();tick();if(end)if(auto* vp=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0)))vp->setViewPosition(0,10000);juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream out(directory.getChildFile(state+"-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!out.openedOk())return false;out.setPosition(0);out.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,out))return false;}return true;};
+  if(!capture("unpaired"))return 50;
+  bridgeProbeCommand(*p,"pair","ui-fixture");
+  auto waitFor=[&](const juce::String& text,int millis){for(int i=0;i<millis/10;++i){tick();if(bridgeProbeCatalog(*p).contains(text))return true;juce::Thread::sleep(10);}return false;};
+  if(!waitFor(" idle ",4000))return 51;juce::Thread::sleep(300);tick();if(!capture("empty"))return 52;
+  if(!click("Refresh"))return 53;juce::Thread::sleep(100);tick();if(!capture("loading"))return 54;
+  if(!waitFor("11111111-1111-4111-8111-111111111111",4000))return 55;tick();if(!capture("ready"))return 56;
+  holder.setVisible(false);tick();if(!bridgeProbeCatalog(*p).contains("visible=0 baseline=1"))return 101;auto marker=directory.getChildFile("hidden-marker");if(!marker.replaceWithText("hidden"))return 103;juce::Thread::sleep(5600);tick();marker.deleteFile();holder.setVisible(true);tick();if(!bridgeProbeCatalog(*p).contains("visible=1 baseline=1"))return 102;juce::Thread::sleep(300);tick();
+  auto* list=dynamic_cast<juce::ListBox*>(find(find,*editor,"Results"));if(!list || list->getListBoxModel()->getNumRows()!=2 || !list->getListBoxModel()->getNameForRow(1).contains(selectedId))return 57;
+  juce::MemoryBlock before,after;p->getStateInformation(before);list->grabKeyboardFocus();
+#if JUCE_MAC
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.2,false);
+#endif
+  if(!list->hasKeyboardFocus(true)){std::cerr<<"FAIL list focus unavailable\n";return 88;}list->selectRow(0);if(!capture("focus"))return 89;list->keyPressed(juce::KeyPress(juce::KeyPress::downKey));tick();if(list->getSelectedRow()!=1)return 71;p->getStateInformation(after);if(before!=after)return 58;
+  if(!click("Refresh") || !waitFor(" idle ",4000))return 59;tick();if(list->getSelectedRow()!=1)return 60;p->getStateInformation(after);if(before!=after)return 61;
+  if(!click("Older") || !waitFor("33333333-3333-4333-8333-333333333333",4000))return 62;tick();p->getStateInformation(after);if(before!=after)return 63;
+  if(!click("Latest") || !waitFor("11111111-1111-4111-8111-111111111111",4000))return 64;tick();if(list->getSelectedRow()!=1)return 65;
+  if(!click("Dismiss"))return 72;tick();if(!click("Refresh") || !waitFor(" idle ",4000))return 73;tick();auto* dismiss=dynamic_cast<juce::Button*>(find(find,*editor,"Dismiss"));if(!dismiss || dismiss->isVisible())return 74;
+  auto* fetchButton=dynamic_cast<juce::Button*>(find(find,*editor,"Fetch selected"));
+  if(!fetchButton)return 66;list->grabKeyboardFocus();for(int i=0;i<30 && !fetchButton->hasKeyboardFocus(true);++i){auto* focused=juce::Component::getCurrentlyFocusedComponent();if(!focused)break;focused->moveKeyboardFocusToSibling(true);}
+  if(!fetchButton || !fetchButton->hasKeyboardFocus(true) || !fetchButton->isEnabled() || !static_cast<juce::Component*>(fetchButton)->keyPressed(juce::KeyPress(juce::KeyPress::returnKey)))return 66;
+  #if JUCE_MAC
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.3,false);
+#else
+  std::cerr<<"UI fixture message pump unavailable on this platform\n";return 77;
+#endif
+  p->getStateInformation(after);juce::MemoryInputStream state(after.getData(),after.getSize(),false);auto saved=juce::JSON::parse(state.readString());if(saved["resultId"].toString()!=selectedId){std::cerr<<"FAIL keyboard selected="<<selectedId<<" saved="<<saved["resultId"].toString()<<" status="<<bridgeProbeStatus(*p)<<" enabled="<<fetchButton->isEnabled()<<"\n";return 67;}
+  for(int i=0;i<400 && !bridgeProbeStatus(*p).startsWith("Result ready:");++i)juce::Thread::sleep(10);
+  const auto downloaded=bridgeProbeResult(*p);if(!downloaded.existsAsFile() || bridgeProbePlacement(*p)!="Suggested start: -2.500000 s")return 78;
+  const auto hash=juce::SHA256(downloaded).toHexString();p->getStateInformation(before);tick();
+  auto* drag=dynamic_cast<juce::Button*>(find(find,*editor,"Drag WAV"));if(!drag || !drag->isEnabled())return 79;
+  auto intact=[&]{juce::MemoryBlock current;p->getStateInformation(current);tick();return current==before && bridgeProbeResult(*p)==downloaded && downloaded.existsAsFile() && juce::SHA256(downloaded).toHexString()==hash && bridgeProbePlacement(*p)=="Suggested start: -2.500000 s" && drag->isEnabled();};
+  auto priorRequests=bridgeProbeNetworkRequests(*p);bridgeProbeCommand(*p,"pair","slow-pair");for(int i=0;i<100 && bridgeProbeNetworkRequests(*p)==priorRequests;++i)juce::Thread::sleep(10);if(bridgeProbeNetworkRequests(*p)==priorRequests)return 104;
+  bridgeProbeCommand(*p,"capture","8");bridgeProbeCommand(*p,"result","must-not-replace");juce::MemoryBlock during;p->getStateInformation(during);if(during!=before || bridgeProbeResult(*p)!=downloaded)return 92;
+  for(int i=0;i<200 && !bridgeProbeStatus(*p).startsWith("Armed");++i)juce::Thread::sleep(10);if(!bridgeProbeStatus(*p).startsWith("Armed"))return 93;
+  tick();list->selectRow(0);if(fetchButton->isEnabled() || static_cast<juce::Component*>(fetchButton)->keyPressed(juce::KeyPress(juce::KeyPress::returnKey)))return 94;
+#if JUCE_MAC
+  CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.1,false);
+#endif
+  p->getStateInformation(during);if(during!=before || bridgeProbeResult(*p)!=downloaded || bridgeProbePlacement(*p)!="Suggested start: -2.500000 s")return 95;
+  bridgeProbeCommand(*p,"cancel",{});for(int i=0;i<200 && bridgeProbeStatus(*p)!="Canceled";++i){head.frame+=512;p->processBlock(audio,midi);juce::Thread::sleep(10);}if(bridgeProbeStatus(*p)!="Canceled")return 96;tick();list->selectRow(1);
+
+  if(!click("Older") || !waitFor("33333333-3333-4333-8333-333333333333",4000) || !intact())return 80;
+  juce::Thread::sleep(5600);tick();if(!bridgeProbeCatalog(*p).contains("33333333-3333-4333-8333-333333333333") || !intact())return 81;
+  if(!click("Latest") || !waitFor("11111111-1111-4111-8111-111111111111",4000) || !intact() || list->getSelectedRow()!=1)return 82;
+  if(!click("Refresh"))return 83;juce::Thread::sleep(300);if(!intact() || list->getSelectedRow()!=1)return 84;
+  auto* pairing=dynamic_cast<juce::TextEditor*>(find(find,*editor,"Pairing code"));if(!pairing)return 85;pairing->setText("ui-fixture");if(!click("Pair"))return 86;
+  juce::Thread::sleep(500);tick();if(dismiss->isVisible() || !intact() || list->getSelectedRow()!=1)return 87;
+  if(!click("Advanced"))return 68;tick();auto* viewport=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0));if(!viewport)return 69;viewport->setViewPosition(0,10000);if(!capture("advanced",true))return 70;
+  if(!click("Refresh") || !waitFor("stale",4000))return 75;tick();if(!capture("stale") || !intact())return 76;
+  std::cout<<"PASS actual editor keyboard Fetch, verified WAV, page/refresh/cache/placement/drag isolation, older background poll and reconnect notice\n";return 0;
+ }
+ if(argc==2 && juce::String(argv[1])=="--catalog") {
+#if JUCE_MAC
+  int qos=-1;for(int i=0;i<200 && (qos=bridgeProbeCatalogQos(*p))==-1;++i)juce::Thread::sleep(10);
+  if(qos!=QOS_CLASS_BACKGROUND){std::cerr<<"FAIL worker QoS "<<qos<<"\n";return 48;}std::cout<<"PASS worker pthread_get_qos_class_np class="<<qos<<" QOS_CLASS_BACKGROUND="<<QOS_CLASS_BACKGROUND<<"\n";
+#endif
+  juce::MemoryBlock before,after;
+  bridgeProbeCatalogVisible(*p,true);bridgeProbeCommand(*p,"pair","catalog-fixture");
+  auto waitFor=[&](const juce::String& needle,int ms){for(int i=0;i<ms/10;++i){if(bridgeProbeCatalog(*p).contains(needle))return true;juce::Thread::sleep(10);}return false;};
+  if(!waitFor("fixture-result",4000)){std::cerr<<"FAIL baseline "<<bridgeProbeCatalog(*p)<<"\n";return 30;}
+  p->getStateInformation(before);bridgeProbeCatalogRefresh(*p);if(!waitFor("stale",4000)){std::cerr<<"FAIL oversized "<<bridgeProbeCatalog(*p)<<"\n";return 31;}
+  bridgeProbeCatalogRefresh(*p);if(!waitFor("retry=10",4000)){std::cerr<<"FAIL malformed "<<bridgeProbeCatalog(*p)<<"\n";return 32;}
+  auto start=juce::Time::getMillisecondCounterHiRes();bridgeProbeCatalogRefresh(*p);if(!waitFor("retry=20",7000)){std::cerr<<"FAIL deadline "<<bridgeProbeCatalog(*p)<<"\n";return 33;}auto elapsed=juce::Time::getMillisecondCounterHiRes()-start;
+  if(elapsed<4500 || elapsed>6500 || !bridgeProbeCatalog(*p).contains("fixture-result")){std::cerr<<"FAIL deadline elapsed "<<elapsed<<"\n";return 34;}
+  p->getStateInformation(after);if(before!=after){std::cerr<<"FAIL persisted state changed\n";return 35;}
+  bridgeProbeCatalogRefresh(*p);if(!waitFor(" flight ",1000))return 36;
+  for(int i=0;i<20;++i)bridgeProbeCatalogRefresh(*p);
+  bridgeProbeCommand(*p,"capture","1");for(int i=0;i<200 && !bridgeProbeStatus(*p).startsWith("Armed");++i)juce::Thread::sleep(10);if(!bridgeProbeStatus(*p).startsWith("Armed"))return 37;
+  for(int c=0;c<2;++c)for(int i=0;i<512;++i)audio.setSample(c,i,0.375f);p->processBlock(audio,midi);for(int c=0;c<2;++c)for(int i=0;i<512;++i)if(audio.getSample(c,i)!=0.375f)return 38;
+  bridgeProbeCommand(*p,"cancel",{});for(int i=0;i<200 && bridgeProbeStatus(*p)!="Canceled";++i){juce::Thread::sleep(10);head.frame+=512;p->processBlock(audio,midi);}if(bridgeProbeStatus(*p)!="Canceled"){std::cerr<<"FAIL cancel "<<bridgeProbeStatus(*p)<<"\n";return 39;}
+  bridgeProbeCommand(*p,"pair","new-session");if(!waitFor("new-result",5000)){std::cerr<<"FAIL re-pair "<<bridgeProbeCatalog(*p)<<"\n";return 40;}
+  if(bridgeProbeCatalog(*p).contains("old-late"))return 41;
+  bridgeProbeCatalogRefresh(*p);if(!waitFor(" flight ",1000))return 42;bridgeProbeCatalogVisible(*p,false);juce::Thread::sleep(2500);
+  if(bridgeProbeCatalog(*p).contains("hidden-late"))return 43;
+  std::unique_ptr<juce::AudioProcessor> second(createPluginFilter());bridgeProbeCatalogVisible(*second,true);bridgeProbeCommand(*second,"pair","new-session");bridgeProbeCatalogVisible(*p,true);
+  bool concurrent=false;for(int i=0;i<300;++i){if(bridgeProbeCatalog(*p).contains(" flight ") && bridgeProbeCatalog(*second).contains(" flight ")){concurrent=true;break;}juce::Thread::sleep(10);}if(!concurrent)return 44;
+  for(int i=0;i<300 && !bridgeProbeCatalog(*second).contains("new-result");++i)juce::Thread::sleep(10);if(!bridgeProbeCatalog(*second).contains("new-result"))return 45;
+  bridgeProbeCatalogVisible(*p,false);bridgeProbeCatalogRefresh(*second);for(int i=0;i<100 && !bridgeProbeCatalog(*second).contains(" flight ");++i)juce::Thread::sleep(10);if(!bridgeProbeCatalog(*second).contains(" flight "))return 46;
+  auto shutdownStart=juce::Time::getMillisecondCounterHiRes();second.reset();auto shutdownElapsed=juce::Time::getMillisecondCounterHiRes()-shutdownStart;if(shutdownElapsed>1000){std::cerr<<"FAIL shutdown "<<shutdownElapsed<<" ms\n";return 47;}bridgeProbeCatalogVisible(*p,false);std::cout<<"PASS shutdown during request "<<shutdownElapsed<<" ms\n";
+  std::cout<<"PASS catalog baseline, 256 KiB cap, malformed response, stalled deadline "<<elapsed<<" ms, retained rows and saved state; capture pass-through, refresh burst, stale pair, hidden reply and simultaneous processors\n";return 0;
+ }
  if(argc==3 && juce::String(argv[1])=="--snapshot") {
   std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);editor->resized();juce::Image image(juce::Image::RGB,editor->getWidth(),editor->getHeight(),true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output{juce::File(argv[2])};if(!output.openedOk())return 6;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 6;
  }
