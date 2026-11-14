@@ -37,13 +37,15 @@ Tool flow:
 2. `daw_attach_logic_capture` with session/project/capture/client-request IDs.
 3. `daw_add_layer_from_context` with the returned binding, model, instrument and canonical frame range.
 4. `logic_get_job` until actual `ready` or a terminal error.
-5. `logic_export_result` to obtain a result ID/asset metadata. Retrieve that result in the AU, then drag the verified local WAV into a new Logic audio track at the displayed position.
+5. `logic_export_result` to obtain a result ID/asset metadata. In the paired AU, select the ready result and choose **Fetch selected**, then drag the verified local WAV into a new Logic audio track at the displayed position.
 
 All tools are also available through `npx tsx server/daw-cli.ts logic <tool> '<JSON arguments>'`. A task accepted response is not a completed audio result. Native file drag requires a downloaded local WAV; copy it into the Logic project for portable playback.
 
 For keyboard-based return, create a new Logic audio track, use File > Import > Audio File, and select the exported WAV shown by Reveal in Finder. Import it at the suggested position. File > Project Management > Consolidate with audio-file copying enabled makes the project independent from the bridge's export folder. Logic can append metadata to an imported WAV; the current native implementation therefore keeps its verified original separately in `~/Library/ACE-Step Bridge/native-results/verified-cache/` and hands out writable copies. Offline restoration validates the original and makes a fresh copy without overwriting earlier exported files.
 
-The Logic Bridge panel exposes a selectable read-only `Result UUID` for each ready job with a result. Copy it into the AU's `Result UUID` field and click `Fetch result`; MCP `logic_export_result` is an alternative. Explicit-context source uploads preserve canonical WAV bytes instead of applying the ordinary upload downsampling optimization.
+The AU Results list shows the paired session's ready results with instrument, duration, signed start and a shortened UUID. Select a row and choose **Fetch selected**. Selection, refresh and paging do not fetch audio or replace a previously downloaded WAV. Use **Refresh** for a new check, **Older** for the next older page and **Latest** to return to the newest page; a selected ID remains selected across navigation and can be fetched when visible again. The full UUID is available to accessibility tools. For manual lookup, open **Advanced**, enter a result UUID and choose **Fetch UUID**. The DAW Logic Bridge panel also exposes a selectable read-only `Result UUID`, and MCP `logic_export_result` is another way to obtain it.
+
+While the AU editor is visible and paired, it polls for results using a separate background worker. On macOS that worker uses background QoS. The first successful latest-page response is a silent baseline; a later result above the session high-water mark shows **New results available** until dismissed. It is a generic notice without a count. An unchanged result set or re-pairing to the same session does not repeat the notice; a restored AU state or a different session starts a new baseline. Background checks do not replace an older page. Failed checks retain the displayed rows, show a stale state and back off automatic retries up to 30 seconds. Pair again after reopening because credentials are not saved. Explicit-context source uploads preserve canonical WAV bytes instead of applying the ordinary upload downsampling optimization.
 
 ## Build and verification
 
@@ -52,6 +54,8 @@ See `plugins/logic-bridge/README.md` for native build and fixture instructions a
 The original [architecture](LOGIC_AU_BRIDGE_DESIGN.md) records the intended behavior and release gates. Current bounded implementation differences are documented in the component READMEs; do not equate deterministic fixture results with a listened-to Base Lego layer.
 
 ## Observed development verification limits
+
+The observations below concern earlier installed builds. The result catalog has passed native editor and loopback fixtures. The repair7 AU was installed and passed Apple's `auval`, and Logic was restarted, but the new catalog workflow has not been verified in Logic because GUI access was blocked. The existing Logic project was preserved and a backup of the previous AU is available.
 
 The installed AU passed Apple's `auval`, and Logic captured a continuous 12-second, 48 kHz stereo passage at 150 BPM. Base inference on that reference completed independently. A real MCP/browser/service run using that previously generated WAV also reached a ready clip, a ready result and a verified export.
 
