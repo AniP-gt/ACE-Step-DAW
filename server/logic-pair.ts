@@ -4,8 +4,13 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 async function main(): Promise<void> {
-  const [name, projectId, outputFile] = process.argv.slice(2);
-  if (!name || !projectId || !outputFile) throw new Error('Usage: npm run bridge:pair -- <session-name> <DAW-project-id> <new-credential-file>');
+  const args = process.argv.slice(2);
+  const nativeOnly = args[0] === '--native-only' || args[0] === '--native-session';
+  const existingSession = args[0] === '--native-session';
+  const [name, projectId, outputFile] = nativeOnly ? [args[1], undefined, undefined] : args;
+  if (!name?.trim() || (nativeOnly ? args.length !== 2 : !projectId || !outputFile)) {
+    throw new Error('Usage: npm run bridge:pair -- --native-only <session-name>\n   or: npm run bridge:pair -- --native-session <session-id>\n   or: npm run bridge:pair -- <session-name> <DAW-project-id> <new-credential-file>');
+  }
   const root = process.env.LOGIC_BRIDGE_ROOT ?? join(homedir(), 'Library/Application Support/ACE-Step Bridge');
   const secret = await readFile(join(root, 'control-token'), 'utf8');
   const base = new URL(process.env.LOGIC_BRIDGE_URL ?? 'http://127.0.0.1:5176/v1/');
@@ -30,8 +35,15 @@ async function main(): Promise<void> {
     req.on('error', reject);
     req.end(JSON.stringify(data));
   });
-  const session = await post('sessions', { name }, secret);
+  const session = existingSession ? { sessionId: name } : await post('sessions', { name }, secret);
   if (typeof session.sessionId !== 'string') throw new Error('Missing session ID.');
+  if (nativeOnly) {
+    const pairing = await post('pairings', { sessionId: session.sessionId, role: 'native' }, secret);
+    if (typeof pairing.code !== 'string') throw new Error('Missing pairing code.');
+    process.stdout.write(JSON.stringify({ sessionId: session.sessionId, nativePairingCode: pairing.code, expiresInSeconds: 120 }, null, 2) + '\n');
+    return;
+  }
+  if (!projectId || !outputFile) throw new Error('Missing DAW project or credential path');
   const codes: Record<string, string> = {};
   for (const role of ['native', 'executor', 'mcp']) {
     const pairing = await post('pairings', { sessionId: session.sessionId, role, projectId }, secret);
