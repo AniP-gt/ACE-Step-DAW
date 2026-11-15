@@ -2,6 +2,7 @@
 #include <juce_cryptography/juce_cryptography.h>
 #include <iostream>
 #include <cstring>
+#include <cmath>
 #if JUCE_MAC
 #include <pthread/qos.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -26,6 +27,8 @@ juce::String bridgeProbeCatalog(juce::AudioProcessor&);
 void bridgeProbeCatalogRefresh(juce::AudioProcessor&);
 int bridgeProbeCatalogQos(juce::AudioProcessor&);
 void bridgeProbeEditorTick(juce::AudioProcessorEditor&);
+juce::String bridgeProbeDirect(juce::AudioProcessor&);
+void bridgeProbeDirectThenCancel(juce::AudioProcessor&,const juce::String&);
 static bool restoreCache(const juce::File& file,const juce::String& resultId,bool expectReady,const juce::String& overrideName={},const juce::String& expectedPlacement="Suggested start: +0.000000 s") {
  struct OwnedPairs {std::vector<juce::File> files;~OwnedPairs(){for(const auto& owned:files){owned.deleteFile();owned.withFileExtension("json").deleteFile();}}} cleanup;
  auto* settings=new juce::DynamicObject();settings->setProperty("stateId","offline-fixture");settings->setProperty("captureSeconds",8);settings->setProperty("resultId",resultId);settings->setProperty("cachedFilename",overrideName.isEmpty()?file.getFileName():overrideName);
@@ -93,6 +96,60 @@ static bool dragGestureChecks() {
 }
 int main(int argc,char** argv) {
  juce::ScopedJuceInitialiser_GUI init;
+ if((argc==4 || argc==5) && juce::String(argv[1])=="--direct-workflow") {
+  const juce::String portText(argv[2]);if(portText.isEmpty() || !portText.containsOnly("0123456789"))return 130;
+  std::unique_ptr<juce::AudioProcessor> fixture(createBridgeProbeProcessor(portText.getIntValue()));if(!fixture)return 131;
+  Playhead head;fixture->setPlayHead(&head);fixture->prepareToPlay(48000,512);juce::AudioBuffer<float> audio(2,512);juce::MidiBuffer midi;
+  juce::File directory(argv[3]);directory.createDirectory();std::unique_ptr<juce::AudioProcessorEditor> editor(fixture->createEditor());
+  auto find=[&](auto&& self,juce::Component& c,const juce::String& name)->juce::Component* {if(c.getName()==name)return &c;for(auto* child:c.getChildren())if(auto* found=self(self,*child,name))return found;return nullptr;};
+  auto click=[&](const juce::String& name){auto* button=dynamic_cast<juce::Button*>(find(find,*editor,name));if(!button || !button->isEnabled())return false;if(button->onClick)button->onClick();return true;};
+  auto snapshot=[&](const juce::String& state,bool end=false){for(auto size:{juce::Point<int>{440,360},juce::Point<int>{640,520},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();bridgeProbeEditorTick(*editor);if(end)if(auto* vp=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0)))vp->setViewPosition(0,10000);juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream out(directory.getChildFile(state+"-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!out.openedOk())return false;out.setPosition(0);out.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,out))return false;}return true;};
+  auto waitFor=[&](auto condition,int ms){for(int i=0;i<ms/10;++i){bridgeProbeEditorTick(*editor);if(condition())return true;juce::Thread::sleep(10);}return false;};
+  if(!snapshot("direct-unpaired"))return 132;
+  auto* pairCode=dynamic_cast<juce::TextEditor*>(find(find,*editor,"Pairing code"));if(!pairCode)return 133;pairCode->setText("fixture");if(!click("Pair"))return 134;
+  if(!waitFor([&]{return bridgeProbeStatus(*fixture)=="Ready";},5000))return 135;
+  auto* duration=dynamic_cast<juce::TextEditor*>(find(find,*editor,"Capture seconds (1 to 120)"));if(!duration)return 136;duration->setText("1");if(!click("Capture"))return 137;
+  if(!waitFor([&]{return bridgeProbeStatus(*fixture).startsWith("Armed");},5000))return 138;
+  for(int block=0;block<100;++block){for(int c=0;c<2;++c)for(int i=0;i<512;++i)audio.setSample(c,i,0.2f*std::sin(2.0*3.141592653589793*440*(head.frame+i)/48000.0));fixture->processBlock(audio,midi);head.frame+=512;juce::Thread::sleep(10);}
+  if(!waitFor([&]{return bridgeProbeStatus(*fixture).startsWith("Captured:");},5000))return 139;
+  auto* text=dynamic_cast<juce::TextEditor*>(find(find,*editor,"Cover prompt"));if(!text)return 140;text->setText("solo violin, preserve melody");if(text->onTextChange)text->onTextChange();bridgeProbeEditorTick(*editor);if(!snapshot("direct-prompt"))return 141;
+  if(argc==5 && juce::String(argv[4])=="--race")bridgeProbeDirectThenCancel(*fixture,text->getText());else if(!click("Generate Cover"))return 142;bridgeProbeEditorTick(*editor);if(!bridgeProbeDirect(*fixture).contains("busy"))return 143;if(click("Generate Cover"))return 144;
+  if(!snapshot("direct-busy"))return 145;
+  editor.reset();editor.reset(fixture->createEditor());if(!bridgeProbeDirect(*fixture).contains("busy"))return 146;
+  const bool recovery=argc==5 && juce::String(argv[4])=="--recovery";
+  if(recovery) {
+   if(!waitFor([&]{return bridgeProbeDirect(*fixture).startsWith("Outcome unknown;");},6000))return 162;
+   if(!snapshot("recovery-unknown"))return 163;
+   juce::Thread::sleep(3500);bridgeProbeEditorTick(*editor);
+   if(!bridgeProbeDirect(*fixture).contains("busy") || click("Generate Cover"))return 164;
+   if(!directory.getChildFile("operator-reconcile").replaceWithText("operator explicitly reconciled backend"))return 165;
+   if(!waitFor([&]{return bridgeProbeDirect(*fixture).startsWith("Generation failed: SUBMISSION_OUTCOME_UNKNOWN");},6000))return 166;
+   if(!snapshot("recovery-failed"))return 167;
+   if(!click("Generate Cover"))return 168;
+  }
+  if(!waitFor([&]{return bridgeProbeStatus(*fixture).startsWith("Result ready:");},15000)){std::cerr<<"FAIL direct generation: "<<bridgeProbeStatus(*fixture)<<" / "<<bridgeProbeDirect(*fixture)<<"\n";return 147;}
+  const auto original=bridgeProbeResult(*fixture);if(!original.existsAsFile() || bridgeProbePlacement(*fixture)!="Suggested start: +0.000000 s")return 148;
+  if(!snapshot("direct-ready"))return 149;
+  editor->setSize(440,360);editor->resized();bridgeProbeEditorTick(*editor);
+  auto* viewport=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0));auto* drag=dynamic_cast<juce::Button*>(find(find,*editor,"Drag WAV"));
+  if(!viewport || !drag || !drag->isEnabled() || !viewport->getViewedComponent())return 159;
+  viewport->setViewPosition(0,10000);
+  if(!viewport->getViewArea().intersects(viewport->getViewedComponent()->getLocalArea(drag,drag->getLocalBounds())))return 160;
+  if(!snapshot("direct-drag",true))return 161;viewport->setViewPosition(0,0);
+  if(!recovery) {
+   text=dynamic_cast<juce::TextEditor*>(find(find,*editor,"Cover prompt"));if(!text)return 150;text->setText("fail fixture");bridgeProbeEditorTick(*editor);if(!click("Generate Cover"))return 151;
+   if(!waitFor([&]{return bridgeProbeDirect(*fixture).startsWith("Generation failed:");},10000))return 152;
+   if(bridgeProbeResult(*fixture)!=original || !original.existsAsFile())return 153;
+   if(!snapshot("direct-failed"))return 154;
+   text->setText("bad wav fixture");bridgeProbeEditorTick(*editor);if(!click("Generate Cover"))return 155;
+   if(!waitFor([&]{return bridgeProbeStatus(*fixture).contains("WAV download failed");},10000))return 156;
+   if(bridgeProbeResult(*fixture)!=original || !original.existsAsFile())return 157;
+   if(!snapshot("direct-download-failed"))return 158;
+  }
+  juce::MemoryBlock state;fixture->getStateInformation(state);juce::MemoryInputStream stream(state,false);auto saved=juce::JSON::parse(stream.readString());auto cached=original.getParentDirectory().getChildFile("verified-cache").getChildFile(saved["cachedFilename"].toString());
+  editor.reset();fixture.reset();original.deleteFile();original.withFileExtension("json").deleteFile();cached.deleteFile();cached.withFileExtension("json").deleteFile();
+  std::cout<<(recovery?"PASS same-processor interrupted, explicit reconcile, failed, fresh user request and ready WAV\n":"PASS native pair, capture, prompt, duplicate suppression, editor reopen, auto-fetch, placement and failed generation preserving WAV\n");return 0;
+ }
  if(argc==2 && juce::String(argv[1])=="--endpoint-self-test") {
   std::unique_ptr<juce::AudioProcessor> production(createPluginFilter());
   std::unique_ptr<juce::AudioProcessor> fixture(createBridgeProbeProcessor(43210));
@@ -149,7 +206,7 @@ int main(int argc,char** argv) {
   auto find=[&](auto&& self,juce::Component& c,const juce::String& name)->juce::Component* {if(c.getName()==name)return &c;for(auto* child:c.getChildren())if(auto* found=self(self,*child,name))return found;return nullptr;};
   auto click=[&](const juce::String& name){auto* button=dynamic_cast<juce::Button*>(find(find,*editor,name));if(!button || !button->isEnabled())return false;if(button->onClick)button->onClick();return true;};
   auto tick=[&]{bridgeProbeEditorTick(*editor);};
-  auto capture=[&](const juce::String& state,bool end=false){for(auto size:{juce::Point<int>{440,360},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();tick();if(end)if(auto* vp=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0)))vp->setViewPosition(0,10000);juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream out(directory.getChildFile(state+"-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!out.openedOk())return false;out.setPosition(0);out.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,out))return false;}return true;};
+  auto capture=[&](const juce::String& state,bool end=false){for(auto size:{juce::Point<int>{440,360},juce::Point<int>{640,520},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();tick();if(end)if(auto* vp=dynamic_cast<juce::Viewport*>(editor->getChildComponent(0)))vp->setViewPosition(0,10000);juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream out(directory.getChildFile(state+"-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!out.openedOk())return false;out.setPosition(0);out.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,out))return false;}return true;};
   if(!capture("unpaired"))return 50;
   bridgeProbeCommand(*p,"pair","ui-fixture");
   auto waitFor=[&](const juce::String& text,int millis){for(int i=0;i<millis/10;++i){tick();if(bridgeProbeCatalog(*p).contains(text))return true;juce::Thread::sleep(10);}return false;};
@@ -240,7 +297,7 @@ int main(int argc,char** argv) {
   for(int i=0;i<500 && !bridgeProbeStatus(*p).startsWith("Result ready:");++i)juce::Thread::sleep(10);
   if(!bridgeProbeResult(*p).existsAsFile() || juce::SHA256(bridgeProbeResult(*p)).toHexString()!=juce::SHA256(cached).toHexString() || bridgeProbePlacement(*p)!="Suggested start: +0.000000 s" || bridgeProbeNetworkRequests(*p)!=0)return 25;
   outputDirectory.createDirectory();std::unique_ptr<juce::AudioProcessorEditor> editor(p->createEditor());editor->setVisible(true);
-  for(auto size:{juce::Point<int>{440,360},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output(outputDirectory.getChildFile("restored-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!output.openedOk())return 26;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 26;}
+  for(auto size:{juce::Point<int>{440,360},juce::Point<int>{640,520},juce::Point<int>{880,720}}){editor->setSize(size.x,size.y);editor->resized();juce::Image image(juce::Image::RGB,size.x,size.y,true);juce::Graphics graphics(image);editor->paintEntireComponent(graphics,true);juce::FileOutputStream output(outputDirectory.getChildFile("restored-"+juce::String(size.x)+"x"+juce::String(size.y)+".png"));if(!output.openedOk())return 26;output.setPosition(0);output.truncate();if(!juce::PNGImageFormat().writeImageToStream(image,output))return 26;}
   std::cout<<"PASS restored actual result placement: "<<bridgeProbePlacement(*p)<<"; screenshots 440x360 and 880x720; zero HTTP requests\n";
  }
  if(argc==4 && juce::String(argv[1])=="--race-restore") {

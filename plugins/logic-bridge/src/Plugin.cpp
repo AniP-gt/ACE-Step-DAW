@@ -1,12 +1,19 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_cryptography/juce_cryptography.h>
 #include "CaptureRing.h"
+#include "DirectGenerationState.h"
 #include "ResultDragButton.h"
 #include "ResultCatalogClient.h"
 #include "ResultCatalogView.h"
 #include "NativeVisibility.h"
 #include <mutex>
 #include <cmath>
+
+static std::u16string utf16Units(const juce::String& value) {
+ auto encoded=value.toUTF16();const auto* unit=encoded.getAddress();std::u16string result;
+ while(*unit)result.push_back(static_cast<char16_t>(*unit++));
+ return result;
+}
 
 class BridgeProcessor final : public juce::AudioProcessor, private juce::Thread {
 public:
@@ -33,8 +40,51 @@ public:
  void changeProgramName(int,const juce::String&) override {}
  bool hasEditor() const override {return true;} juce::AudioProcessorEditor* createEditor() override;
  void getStateInformation(juce::MemoryBlock& b) override { std::lock_guard<std::mutex> lock(mutex);juce::MemoryOutputStream s(b,false);s.writeString(juce::JSON::toString(object({{"stateId",stateId},{"sessionDisplay",sessionDisplay},{"captureSeconds",captureSeconds},{"resultId",savedResultId},{"cachedFilename",cachedFilename},{"cacheVersion",cacheVersion}}))); }
- void setStateInformation(const void* data,int bytes) override { juce::MemoryInputStream s(data,static_cast<size_t>(bytes),false);auto saved=juce::JSON::parse(s.readString());if(!saved.isObject())return;std::lock_guard<std::mutex> lock(mutex);stateId=saved["stateId"].toString();sessionDisplay=saved["sessionDisplay"].toString();captureSeconds=juce::jlimit(1,120,static_cast<int>(saved["captureSeconds"]));savedResultId=saved["resultId"].toString();cachedFilename=saved["cachedFilename"].toString();cacheVersion=static_cast<int>(saved["cacheVersion"]);++selectionRevision;++stateRevision;catalog.restore();catalogWake.notify_one();credentialsResetRequested=true;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;localResult=juce::File();placementText.clear();if(pending=="capture")captureReserved=false;pending.clear();argument.clear();if(!cachedFilename.isEmpty()){pending="restore";argument.clear();message="Restoring cached result";}else message="Disconnected"; }
- void command(juce::String op,juce::String arg={}) {std::lock_guard<std::mutex> lock(mutex);if(op=="result" && captureReserved)return;if(op=="capture"){if(captureReserved)return;captureReserved=true;captureSeconds=juce::jlimit(1,120,arg.getIntValue());}else if(pending=="capture")captureReserved=false;if(op=="result"){savedResultId=arg;cachedFilename.clear();cacheVersion=1;localResult=juce::File();placementText.clear();++selectionRevision;message="Fetching result";}pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;}
+ void setStateInformation(const void* data,int bytes) override { juce::MemoryInputStream s(data,static_cast<size_t>(bytes),false);auto saved=juce::JSON::parse(s.readString());if(!saved.isObject())return;std::lock_guard<std::mutex> lock(mutex);stateId=saved["stateId"].toString();sessionDisplay=saved["sessionDisplay"].toString();captureSeconds=juce::jlimit(1,120,static_cast<int>(saved["captureSeconds"]));savedResultId=saved["resultId"].toString();cachedFilename=saved["cachedFilename"].toString();cacheVersion=static_cast<int>(saved["cacheVersion"]);++selectionRevision;++stateRevision;direct.reset();directFetching=false;directDelivered=false;catalog.restore();catalogWake.notify_one();credentialsResetRequested=true;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;localResult=juce::File();placementText.clear();if(pending=="capture")captureReserved=false;pending.clear();argument.clear();if(!cachedFilename.isEmpty()){pending="restore";argument.clear();message="Restoring cached result";}else message="Disconnected"; }
+ void command(juce::String op,juce::String arg={}) {
+  std::lock_guard<std::mutex> lock(mutex);
+  commandLocked(op,arg);
+ }
+ void probeDirectThenCancel(const juce::String& prompt) {
+  std::lock_guard<std::mutex> lock(mutex);
+  commandLocked("direct",prompt);
+  commandLocked("cancel",{});
+ }
+ void commandLocked(juce::String op,juce::String arg={}) {
+  if(op=="direct") {
+   if(captureReserved || directFetching || pending.isNotEmpty())return;
+   auto text=utf16Units(arg);
+   auto request=direct.begin(juce::Uuid().toString().toStdString(),std::move(text));
+   if(!request){message="Capture audio and enter a prompt (up to 4096 UTF-16 units)";return;}
+   directDelivered=false;pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;
+   return;
+  }
+  if(direct.busy() || directFetching)return;
+  if(op=="result" && captureReserved)return;
+  if(op=="capture"){if(captureReserved)return;captureReserved=true;captureSeconds=juce::jlimit(1,120,arg.getIntValue());}
+  else if(pending=="capture")captureReserved=false;
+  if(op=="result"){savedResultId=arg;cachedFilename.clear();cacheVersion=1;localResult=juce::File();placementText.clear();++selectionRevision;message="Fetching result";}
+  pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;
+ }
+ struct DirectSnapshot {juce::String source,status;bool paired,busy,hasSource;};
+ DirectSnapshot directSnapshot() {
+  std::lock_guard<std::mutex> lock(mutex);
+  juce::String source=direct.sourceId().empty()?"No captured audio":"Source: "+juce::String(direct.sourceId()).substring(0,8)+"  |  "+juce::String(direct.duration(),2)+" s";
+  juce::String status;
+  switch(direct.status()) {
+   case DirectGenerationState::Status::idle: status="Capture audio, then describe the sound";break;
+   case DirectGenerationState::Status::submitting: status="Submitting Cover request";break;
+   case DirectGenerationState::Status::queued: status="Queued";break;
+   case DirectGenerationState::Status::running: status="Generating";break;
+   case DirectGenerationState::Status::unknown: status="Outcome unknown; checking status";break;
+   case DirectGenerationState::Status::ready: status=directFetching?"Fetching WAV":"Generation ready";break;
+   case DirectGenerationState::Status::failed: status="Generation failed: "+juce::String(direct.error());break;
+  }
+  return {source,status,direct.paired(),direct.busy() || directFetching,!direct.sourceId().empty()};
+ }
+ juce::String promptText(){std::lock_guard<std::mutex> lock(mutex);return savedPrompt;}
+ void setPromptText(const juce::String& text){std::lock_guard<std::mutex> lock(mutex);savedPrompt=text;}
+
  void catalogVisible(bool visible) {std::lock_guard<std::mutex> lock(mutex);catalog.setVisible(visible);if(visible)catalog.refresh();catalogWake.notify_one();}
  int port() const {return bridgePort;}
  int catalogQos() const {return catalogQosValue.load();}
@@ -75,7 +125,8 @@ private:
  CaptureRing ring;
  std::atomic<double> sampleRate{48000};
  std::mutex mutex;
- juce::String pending,argument,message="Disconnected",token,sessionId,sessionDisplay,savedResultId,cachedFilename;
+ juce::String pending,argument,message="Disconnected",token,sessionId,sessionDisplay,savedResultId,cachedFilename,savedPrompt;
+ DirectGenerationState direct;bool directFetching=false,directDelivered=false;double nextDirectPoll=0;
  std::atomic<unsigned> networkRequests{0};
  uint64_t selectionRevision=0,pendingRevision=0,stateRevision=0,pendingStateRevision=0;
  bool credentialsResetRequested=false,captureReserved=false;
@@ -98,7 +149,7 @@ private:
   return response;
  }
  static juce::var object(std::initializer_list<std::pair<juce::Identifier,juce::var>> values) {auto* o=new juce::DynamicObject();for(const auto& v:values)o->setProperty(v.first,v.second);return juce::var(o);}
- void upload(const juce::MemoryBlock& pcm) {
+ void upload(const juce::MemoryBlock& pcm,uint64_t hostRevision) {
   show("Uploading");
   auto c=request("POST","/captures",object({{"sessionId",sessionId},{"instanceId",instanceId},{"label","Logic insert"},{"sampleRate",ring.rate},{"channels",ring.channels},{"expectedFrames",static_cast<juce::int64>(ring.target)},{"hostStartSample",static_cast<juce::int64>(ring.start.sample)},{"tempo",ring.start.tempo},{"timeSignature",juce::Array<juce::var>{ring.start.numerator,ring.start.denominator}}}));
   auto id=c["captureId"].toString();
@@ -110,7 +161,7 @@ private:
    }
    auto ready=request("POST","/captures/"+id+"/finalize",object({{"sha256",juce::SHA256(pcm).toHexString()}}));
    if(ready["state"].toString()!="ready") throw juce::String("Canonical conversion is not ready");
-   show("Captured: "+id);
+   {std::lock_guard<std::mutex> lock(mutex);if(hostRevision==stateRevision){direct.captureReady(sessionId.toStdString(),id.toStdString(),static_cast<double>(ready["canonicalFrameCount"])/48000.0);message="Captured: "+id;}}
   } catch(...) {try{request("POST","/captures/"+id+"/cancel",object({}));}catch(...){}throw;}
  }
  static juce::String checkedPlacement(const juce::var& value) {
@@ -179,6 +230,47 @@ private:
   }
   return "Failed: unknown capture error";
  }
+ void submitDirect(const juce::String& prompt) {
+  std::optional<DirectGenerationState::Request> active;
+  {std::lock_guard<std::mutex> lock(mutex);active=direct.active();}
+  if(!active)return;
+  try {
+   auto reply=request("POST","/direct-jobs",object({{"sessionId",juce::String(active->sessionId)}, {"captureId",juce::String(active->captureId)}, {"clientRequestId",juce::String(active->clientRequestId)}, {"prompt",prompt}}));
+   std::lock_guard<std::mutex> lock(mutex);
+   if(!direct.apply(*active,reply["requestId"].toString().toStdString(),reply["sessionId"].toString().toStdString(),reply["captureId"].toString().toStdString(),reply["state"].toString().toStdString(),reply["resultId"].toString().toStdString(),reply["error"].toString().toStdString()))direct.outcomeUnknown(*active);
+  } catch(const juce::String& error) {
+   std::lock_guard<std::mutex> lock(mutex);
+   const auto code=error.startsWith("HTTP ")?error.substring(5,8).getIntValue():0;
+   if(code>=400 && code<500 && code!=408)direct.rejected(*active,error.toStdString());else direct.outcomeUnknown(*active);
+  }
+  nextDirectPoll=0;
+ }
+ void pollDirect() {
+  std::optional<DirectGenerationState::Request> active;juce::String serverId;bool needsPoll=false;
+  {std::lock_guard<std::mutex> lock(mutex);
+   if(!direct.active() || directFetching)return;
+   active=direct.active();serverId=direct.serverId();
+   needsPoll=direct.busy() || (direct.status()==DirectGenerationState::Status::ready && direct.resultId().empty());
+   if(direct.status()==DirectGenerationState::Status::ready && !direct.resultId().empty() && !directDelivered)needsPoll=true;
+  }
+  if(!needsPoll || juce::Time::getMillisecondCounterHiRes()<nextDirectPoll)return;
+  nextDirectPoll=juce::Time::getMillisecondCounterHiRes()+1500;
+  try {
+   juce::var reply;
+   if(serverId.isNotEmpty())reply=request("GET","/direct-jobs/"+juce::URL::addEscapeChars(serverId,false));
+   else reply=request("GET","/direct-jobs?sessionId="+juce::URL::addEscapeChars(juce::String(active->sessionId),true)+"&clientRequestId="+juce::URL::addEscapeChars(juce::String(active->clientRequestId),true));
+   juce::String result;uint64_t revision=0;
+   {std::lock_guard<std::mutex> lock(mutex);
+    if(!direct.apply(*active,reply["requestId"].toString().toStdString(),reply["sessionId"].toString().toStdString(),reply["captureId"].toString().toStdString(),reply["state"].toString().toStdString(),reply["resultId"].toString().toStdString(),reply["error"].toString().toStdString())){direct.outcomeUnknown(*active);return;}
+    if(direct.status()==DirectGenerationState::Status::ready){result=juce::String(direct.resultId());directFetching=true;revision=selectionRevision;}
+   }
+   if(result.isNotEmpty()) {
+    try {fetchResult(result,revision);}
+    catch(const juce::String& error) {std::lock_guard<std::mutex> lock(mutex);if(direct.matches(*active))message="Generation ready; WAV download failed: "+error+". Fetch it from Results.";}
+    std::lock_guard<std::mutex> lock(mutex);if(direct.matches(*active)){directFetching=false;directDelivered=true;}
+   }
+  } catch(const juce::String&) {std::lock_guard<std::mutex> lock(mutex);direct.outcomeUnknown(*active);}
+ }
  void run() override {
   juce::MemoryBlock pcm; std::array<float,8192> scratch{}; bool active=false,uploading=false;
   uint64_t lastHeartbeat=0;double lastActivity=0;
@@ -186,7 +278,8 @@ private:
    juce::String op,arg;uint64_t revision=0,hostRevision=0;{std::lock_guard<std::mutex> lock(mutex);if(credentialsResetRequested){token.clear();sessionId.clear();credentialsResetRequested=false;}op=pending;arg=argument;revision=pendingRevision;hostRevision=pendingStateRevision;pending.clear();}
    try {
     if(op=="restore") restoreCachedResult();
-    if(op=="pair" && !active) {auto r=request("POST","/pairings/claim",object({{"code",arg}}));if(r["role"].toString()!="native" || r["token"].toString().isEmpty() || r["sessionId"].toString().isEmpty()) throw juce::String("Pairing requires a valid native credential");{std::lock_guard<std::mutex> lock(mutex);if(hostRevision==stateRevision){token=r["token"].toString();sessionId=r["sessionId"].toString();sessionDisplay=sessionId;catalog.pair(sessionId.toStdString(),token.toStdString());catalog.refresh();catalogWake.notify_one();message="Ready";}}}
+    if(op=="direct" && !active) submitDirect(arg);
+    if(op=="pair" && !active) {auto r=request("POST","/pairings/claim",object({{"code",arg}}));if(r["role"].toString()!="native" || r["token"].toString().isEmpty() || r["sessionId"].toString().isEmpty()) throw juce::String("Pairing requires a valid native credential");{std::lock_guard<std::mutex> lock(mutex);if(hostRevision==stateRevision){token=r["token"].toString();sessionId=r["sessionId"].toString();sessionDisplay=sessionId;catalog.pair(sessionId.toStdString(),token.toStdString());direct.pair(sessionId.toStdString());catalog.refresh();catalogWake.notify_one();message="Ready";}}}
     if(op=="result" && !active) fetchResult(arg,revision);
     if(op=="cancel") ring.cancel();
     if(op=="capture" && !active) {
@@ -199,10 +292,11 @@ private:
      auto state=ring.state.load(); auto n=ring.drain(scratch.data(),4096);if(n) pcm.append(scratch.data(),n*static_cast<uint64_t>(ring.channels)*4);
      auto hb=ring.heartbeat.load();auto now=juce::Time::getMillisecondCounterHiRes();if(hb!=lastHeartbeat){lastHeartbeat=hb;lastActivity=now;}
      if(state==CaptureRing::Capturing) {if(now-lastActivity>2000) {ring.cancel();show("Failed: host processing suspended; resume to reset");} else show("Capturing");}
-     if(state==CaptureRing::Complete && !n) {active=false;uploading=true;upload(pcm);pcm.reset();std::lock_guard<std::mutex> lock(mutex);captureReserved=false;uploading=false;}
+     if(state==CaptureRing::Complete && !n) {active=false;uploading=true;upload(pcm,hostRevision);pcm.reset();std::lock_guard<std::mutex> lock(mutex);captureReserved=false;uploading=false;}
      if(state==CaptureRing::Failed || state==CaptureRing::Canceled) {active=false;pcm.reset();std::lock_guard<std::mutex> lock(mutex);captureReserved=false;message=state==CaptureRing::Failed?captureFailure():juce::String("Canceled");}
     }
    } catch(const juce::String& error) {if(active) ring.cancel();std::lock_guard<std::mutex> lock(mutex);if((op=="capture" && !active) || uploading){captureReserved=false;uploading=false;}if((op!="result" || revision==selectionRevision) && (op!="pair" || hostRevision==stateRevision))message="Failed: "+error;}
+   if(!active)pollDirect();
    wait(10);
   }
  }
@@ -211,19 +305,25 @@ private:
 class BridgeEditor final : public juce::AudioProcessorEditor,private juce::Timer {
  BridgeProcessor& bridge;
  CatalogLookAndFeel catalogLook;juce::Viewport viewport;juce::Component content;
- juce::Label statusLabel,durationLabel,placementLabel;
- juce::TextEditor code,length,resultId;
- juce::TextButton pair{"Pair"},capture{"Capture"},cancel{"Cancel"},manualFetch{"Fetch UUID"},advanced{"Advanced"},reveal{"Reveal in Finder"};
+ juce::Label statusLabel,durationLabel,placementLabel,sourceLabel,directStatus;
+ juce::TextEditor code,length,resultId,prompt;
+ juce::ComboBox generationMode;
+ juce::TextButton pair{"Pair"},capture{"Capture"},cancel{"Cancel capture"},manualFetch{"Fetch UUID"},advanced{"Advanced"},reveal{"Reveal in Finder"},generate{"Generate Cover"};
  ResultCatalogView catalogView;ResultDragButton drag;
  bool advancedOpen=false,visibleToCatalog=false;
 public:
  explicit BridgeEditor(BridgeProcessor& p):AudioProcessorEditor(p),bridge(p),drag([this]{return bridge.result();}) {
   setLookAndFeel(&catalogLook);addAndMakeVisible(viewport);viewport.setViewedComponent(&content,false);viewport.setScrollBarsShown(true,false);
-  for(auto* c:std::initializer_list<juce::Component*>{&statusLabel,&durationLabel,&placementLabel,&code,&length,&resultId,&pair,&capture,&cancel,&manualFetch,&advanced,&catalogView,&drag,&reveal})content.addAndMakeVisible(c);
+  for(auto* c:std::initializer_list<juce::Component*>{&statusLabel,&durationLabel,&placementLabel,&code,&length,&resultId,&pair,&capture,&cancel,&manualFetch,&advanced,&catalogView,&drag,&reveal,&generationMode,&sourceLabel,&directStatus,&prompt,&generate})content.addAndMakeVisible(c);
   placementLabel.setName("Suggested start");placementLabel.setTitle("Suggested placement in Logic");placementLabel.setDescription("Seconds from project start. Place the WAV manually in Logic.");placementLabel.setEditable(false,false,false);placementLabel.setWantsKeyboardFocus(true);
   code.setTextToShowWhenEmpty("One-use pairing code",findColour(juce::Label::textColourId));code.setTitle("Pairing code");code.setName("Pairing code");
-  durationLabel.setText("Seconds",juce::dontSendNotification);length.setText(juce::String(bridge.savedSeconds()));length.setTitle("Capture seconds (1 to 120)");
+  durationLabel.setText("Seconds",juce::dontSendNotification);length.setText(juce::String(bridge.savedSeconds()));length.setTitle("Capture seconds (1 to 120)");length.setName("Capture seconds (1 to 120)");
   resultId.setText(bridge.savedResult());resultId.setTextToShowWhenEmpty("Result UUID",findColour(juce::Label::textColourId));resultId.setTitle("Result UUID");
+  generationMode.addItem("Direct Cover",1);generationMode.addItem("ACE-Step DAW",2);generationMode.setSelectedId(1,juce::dontSendNotification);generationMode.setTitle("Generation mode");generationMode.setName("Generation mode");
+  generationMode.onChange=[this]{layoutContent();};
+  prompt.setMultiLine(true);prompt.setReturnKeyStartsNewLine(true);prompt.setText(bridge.promptText(),false);prompt.setTextToShowWhenEmpty("Describe the instrument and sound",findColour(juce::Label::textColourId));prompt.setTitle("Cover prompt");prompt.setName("Cover prompt");prompt.onTextChange=[this]{bridge.setPromptText(prompt.getText());};
+  sourceLabel.setTitle("Captured source");sourceLabel.setName("Captured source");directStatus.setTitle("Generation status");directStatus.setName("Generation status");
+  generate.setName("Generate Cover");generate.setTitle("Generate Cover from captured audio");generate.onClick=[this]{bridge.command("direct",prompt.getText());};
   pair.onClick=[this]{bridge.command("pair",code.getText());code.clear();};capture.onClick=[this]{bridge.command("capture",length.getText());};cancel.onClick=[this]{bridge.command("cancel");};manualFetch.onClick=[this]{bridge.command("result",resultId.getText());};
   catalogView.refresh=[this]{bridge.catalogRefresh();};catalogView.older=[this](const std::string& cursor){bridge.catalogOlder(cursor);};catalogView.latest=[this]{bridge.catalogLatest();};catalogView.dismiss=[this]{bridge.catalogDismiss();};catalogView.fetch=[this](const juce::String& id){bridge.command("result",id);};
   advanced.onClick=[this]{advancedOpen=!advancedOpen;layoutContent();};reveal.onClick=[this]{bridge.result().revealToUser();};
@@ -232,12 +332,40 @@ public:
  void probeTick() {timerCallback();}
  ~BridgeEditor() override {bridge.catalogVisible(false);setLookAndFeel(nullptr);}
  void visibilityChanged() override {syncVisibility();}
- void timerCallback() override {syncVisibility();auto s=bridge.status();statusLabel.setText(s,juce::dontSendNotification);bool busy=s.startsWith("Armed")||s=="Capturing"||s=="Uploading";capture.setEnabled(!busy);pair.setEnabled(!busy);length.setEnabled(!busy);manualFetch.setEnabled(!busy);auto snap=bridge.catalogSnapshot();catalogView.update(std::move(snap.page),snap.paired,snap.inFlight,snap.baseline,snap.notice,snap.stale,snap.retrySeconds,busy);auto placement=bridge.placement();placementLabel.setText(placement.isEmpty()?"Suggested start: unavailable":placement,juce::dontSendNotification);bool ready=bridge.result().existsAsFile();drag.setEnabled(ready);reveal.setEnabled(ready);}
+ void timerCallback() override {
+  syncVisibility();auto s=bridge.status();statusLabel.setText(s,juce::dontSendNotification);
+  const auto direct=bridge.directSnapshot();
+  const bool busy=s.startsWith("Armed") || s=="Capturing" || s=="Uploading" || direct.busy;
+  capture.setEnabled(!busy);pair.setEnabled(!busy);length.setEnabled(!busy);manualFetch.setEnabled(!busy);cancel.setEnabled(!direct.busy);
+  sourceLabel.setText(direct.source,juce::dontSendNotification);
+  directStatus.setText(generationMode.getSelectedId()==1?direct.status:"Use ACE-Step DAW with this capture.",juce::dontSendNotification);
+  const auto text=utf16Units(prompt.getText());
+  generate.setEnabled(!busy && direct.paired && direct.hasSource && DirectGenerationState::validPrompt(text));
+  auto snap=bridge.catalogSnapshot();catalogView.update(std::move(snap.page),snap.paired,snap.inFlight,snap.baseline,snap.notice,snap.stale,snap.retrySeconds,busy);
+  auto placement=bridge.placement();placementLabel.setText(placement.isEmpty()?"Suggested start: unavailable":placement,juce::dontSendNotification);
+  bool ready=bridge.result().existsAsFile();drag.setEnabled(ready);reveal.setEnabled(ready);
+ }
  void paint(juce::Graphics& g) override {g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));}
  void resized() override {viewport.setBounds(getLocalBounds());layoutContent();}
 private:
  void syncVisibility(){const auto* peer=getPeer();const bool showing=isShowing() && peer!=nullptr && nativeViewIsVisible(peer->getNativeHandle());if(showing!=visibleToCatalog){visibleToCatalog=showing;bridge.catalogVisible(showing);}}
- void layoutContent() {int width=juce::jmax(1,viewport.getWidth()-viewport.getScrollBarThickness());content.setSize(width,advancedOpen?660:618);auto b=content.getLocalBounds().reduced(16);statusLabel.setBounds(b.removeFromTop(40));auto row=b.removeFromTop(36);pair.setBounds(row.removeFromRight(90));code.setBounds(row.reduced(2));b.removeFromTop(8);row=b.removeFromTop(36);durationLabel.setBounds(row.removeFromLeft(65));length.setBounds(row.removeFromLeft(45));cancel.setBounds(row.removeFromRight(100));capture.setBounds(row.reduced(4,0));b.removeFromTop(12);catalogView.setBounds(b.removeFromTop(290));b.removeFromTop(8);advanced.setBounds(b.removeFromTop(34).removeFromLeft(110));resultId.setVisible(advancedOpen);manualFetch.setVisible(advancedOpen);if(advancedOpen){row=b.removeFromTop(38);manualFetch.setBounds(row.removeFromRight(110).reduced(2));resultId.setBounds(row.reduced(2));}b.removeFromTop(8);row=b.removeFromTop(36);drag.setBounds(row.removeFromLeft(row.getWidth()/2).reduced(2));reveal.setBounds(row.reduced(2));b.removeFromTop(8);placementLabel.setBounds(b.removeFromTop(32));}
+ void layoutContent() {
+  const bool directMode=generationMode.getSelectedId()==1;
+  const int width=juce::jmax(1,viewport.getWidth()-viewport.getScrollBarThickness());
+  content.setSize(width,(advancedOpen?660:618)+(directMode?186:74));
+  auto b=content.getLocalBounds().reduced(16);
+  statusLabel.setBounds(b.removeFromTop(40));
+  auto row=b.removeFromTop(36);pair.setBounds(row.removeFromRight(90));code.setBounds(row.reduced(2));
+  b.removeFromTop(8);row=b.removeFromTop(36);durationLabel.setBounds(row.removeFromLeft(65));length.setBounds(row.removeFromLeft(45));cancel.setBounds(row.removeFromRight(120));capture.setBounds(row.reduced(4,0));
+  b.removeFromTop(10);generationMode.setBounds(b.removeFromTop(34));
+  sourceLabel.setVisible(directMode);prompt.setVisible(directMode);generate.setVisible(directMode);
+  if(directMode){sourceLabel.setBounds(b.removeFromTop(28));prompt.setBounds(b.removeFromTop(56).reduced(2));row=b.removeFromTop(38);generate.setBounds(row.removeFromRight(150).reduced(2));directStatus.setBounds(row.reduced(2));}
+  else directStatus.setBounds(b.removeFromTop(32));
+  b.removeFromTop(12);catalogView.setBounds(b.removeFromTop(290));b.removeFromTop(8);
+  advanced.setBounds(b.removeFromTop(34).removeFromLeft(110));resultId.setVisible(advancedOpen);manualFetch.setVisible(advancedOpen);
+  if(advancedOpen){row=b.removeFromTop(38);manualFetch.setBounds(row.removeFromRight(110).reduced(2));resultId.setBounds(row.reduced(2));}
+  b.removeFromTop(8);row=b.removeFromTop(36);drag.setBounds(row.removeFromLeft(row.getWidth()/2).reduced(2));reveal.setBounds(row.reduced(2));b.removeFromTop(8);placementLabel.setBounds(b.removeFromTop(32));
+ }
 };
 juce::AudioProcessorEditor* BridgeProcessor::createEditor(){return new BridgeEditor(*this);}
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new BridgeProcessor();}
@@ -259,3 +387,7 @@ void bridgeProbeCatalogRefresh(juce::AudioProcessor& p){static_cast<BridgeProces
 int bridgeProbeCatalogQos(juce::AudioProcessor& p){return static_cast<BridgeProcessor&>(p).catalogQos();}
 
 void bridgeProbeEditorTick(juce::AudioProcessorEditor& editor){static_cast<BridgeEditor&>(editor).probeTick();}
+
+juce::String bridgeProbeDirect(juce::AudioProcessor& p){auto s=static_cast<BridgeProcessor&>(p).directSnapshot();return s.status+" | "+s.source+(s.busy?" | busy":" | idle");}
+
+void bridgeProbeDirectThenCancel(juce::AudioProcessor& p,const juce::String& prompt){static_cast<BridgeProcessor&>(p).probeDirectThenCancel(prompt);}

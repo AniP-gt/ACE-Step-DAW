@@ -37,3 +37,7 @@ add_test(NAME result_catalog COMMAND result_catalog_test)
 add_executable(generation_state_test tests/generation_state_test.cpp)
 target_include_directories(generation_state_test PRIVATE src)
 add_test(NAME generation_state COMMAND generation_state_test)
+
+add_executable(direct_generation_state_test tests/direct_generation_state_test.cpp)
+target_include_directories(direct_generation_state_test PRIVATE src)
+add_test(NAME direct_generation_state COMMAND direct_generation_state_test)
