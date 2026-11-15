@@ -24,8 +24,10 @@ class AudioImportError extends Error {
 export async function importAudioFile(
   file: File,
   startTime = 0,
-  target?: string | { readonly trackId?: string; readonly preserveSource: boolean; readonly onCreated?: (ownership: AudioImportOwnership) => Promise<void> },
+  target?: string | { readonly trackId?: string; readonly preserveSource: boolean; readonly onCreated?: (ownership: AudioImportOwnership) => Promise<void>; readonly guard?: () => void },
 ): Promise<AudioImportResult> {
+  const guard = typeof target === 'object' ? target.guard : undefined;
+  guard?.();
   const trackId = typeof target === 'string' ? target : target?.trackId;
   const preserveSource = typeof target === 'object' && target.preserveSource;
   const project = useProjectStore.getState().project;
@@ -39,6 +41,7 @@ export async function importAudioFile(
 
   const engine = getAudioEngine();
   const audioBuffer = await engine.ctx.decodeAudioData(await file.arrayBuffer());
+  guard?.();
   const currentProject = useProjectStore.getState().project;
   if (currentProject?.id !== project.id) {
     throw new AudioImportError('Project changed during audio import');
@@ -72,11 +75,14 @@ export async function importAudioFile(
   if (!clip) throw new AudioImportError('Unable to create an audio clip');
   if (typeof target === 'object' && target.onCreated) {
     await target.onCreated({ projectId: project.id, trackId: targetTrackId, clipId: clip.id });
+    guard?.();
     if (useProjectStore.getState().project?.id !== project.id) throw new AudioImportError('Project changed during audio import');
   }
 
   const audioKey = await saveAudioBlob(project.id, clip.id, 'isolated', wavBlob);
+  guard?.();
   const peaks = await computeWaveformWithMipmap(audioKey, trimmedBuffer);
+  guard?.();
   const completedProject = useProjectStore.getState().project;
   if (completedProject?.id !== project.id) {
     throw new AudioImportError('Project changed during audio import');

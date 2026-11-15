@@ -167,3 +167,24 @@ describe('reference import recovery', () => {
     expect(fixture.bindings).toHaveLength(0);
   });
 });
+
+it('does not complete an import or create a binding after same-project re-pair', async () => {
+  vi.stubGlobal('File', NodeFile);
+  useProjectStore.getState().createProject({ bpm: 120 });
+  const projectId = useProjectStore.getState().project!.id;
+  useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: 'old', sessionId: 'session', projectId, executorId: 'old-executor' });
+  let resume!: () => void;
+  let started!: () => void;
+  const reached = new Promise<void>(resolve => { started = resolve; });
+  const blocked = new Promise<void>(resolve => { resume = resolve; });
+  vi.spyOn(audio, 'saveAudioBlob').mockImplementationOnce(async () => { started(); await blocked; return 'saved'; });
+  const pending = attachLogicCapture({ sessionId: 'session', projectId, captureId: 'capture', clientRequestId: 'request' });
+  await reached;
+  useLogicBridgeStore.setState({ token: 'new', executorId: 'new-executor' });
+  resume();
+  await expect(pending).rejects.toThrow('STALE_BINDING');
+  const clip = useProjectStore.getState().project!.tracks.flatMap(track => track.clips)[0];
+  expect(clip.generationStatus).not.toBe('ready');
+  expect(fixture.bindings).toHaveLength(0);
+  vi.restoreAllMocks(); vi.unstubAllGlobals();
+});

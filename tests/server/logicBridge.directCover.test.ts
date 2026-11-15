@@ -256,3 +256,17 @@ it('rejects malformed completed WAV without retry and releases occupancy', async
   const first = await f.json(await f.api(f.token, '/direct-jobs', request)); await untilState(f, first.requestId, 'failed');
   expect(f.count()).toBe(1); expect((await f.api(f.token, '/direct-jobs', { ...request, clientRequestId: 'after-invalid' })).status).toBe(200);
 });
+
+it('does not accept a native layer intent while Direct Cover occupies the backend', async () => {
+  const f = await fixture();
+  const executor = await f.pair('executor');
+  await f.api(executor, '/executor/register', { sessionId: f.sessionId, projectId: 'project-a', executorId: 'executor-a', modelId: 'base', instruments: ['piano'], outputSemantics: 'isolated-layer' });
+  const prepare = await f.json(await f.api(f.token, '/native-requests', { sessionId: f.sessionId, kind: 'prepare', clientRequestId: 'prep', captureId: f.captureId }));
+  const binding = await f.json(await f.api(executor, '/bindings', { sessionId: f.sessionId, projectId: 'project-a', captureId: f.captureId, clipId: 'clip', clientRequestId: 'bind' }));
+  await f.api(executor, `/native-requests/${prepare.requestId}/prepared`, { sessionId: f.sessionId, bindingId: binding.bindingId });
+  f.behavior.holdPoll = true;
+  expect((await f.api(f.token, '/direct-jobs', { sessionId: f.sessionId, captureId: f.captureId, clientRequestId: 'cover', prompt: 'cover' })).status).toBe(200);
+  await expect.poll(() => f.behavior.heldPolls).toBeGreaterThan(0);
+  expect((await f.api(f.token, '/native-requests', { sessionId: f.sessionId, kind: 'generation', clientRequestId: 'layer', preparedRequestId: prepare.requestId, instrument: 'piano' })).status).toBe(409);
+  f.releasePoll();
+});

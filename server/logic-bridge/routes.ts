@@ -109,8 +109,11 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
         executors.set(sessionId, { sessionId, projectId, executorId, credentialToken: credential === 'control' ? db.controlToken : credential?.token ?? '', modelId, instruments, seen: Date.now() }); return { registered: true };
       }
       const executor = liveExecutor(sessionId); executor.seen = Date.now();
-      if (id === 'jobs' && method === 'GET') return { jobs: db.state.jobs.filter(job => job.sessionId === sessionId && job.projectId === executor.projectId && (backendOccupancy(job) !== 'released' || job.state === 'canceled')) };
-      if (id === 'native-requests' && method === 'GET') return { requests: db.state.nativeRequests.filter(item => item.sessionId === sessionId && item.projectId === executor.projectId && item.state === 'pending').map(publicReceipt) };
+      if (id === 'jobs' && method === 'GET') return { jobs: db.state.jobs.filter(job => job.sessionId === sessionId && job.projectId === executor.projectId && (backendOccupancy(job) !== 'released' || job.state === 'canceled')).map(job => {
+        const native = db.state.nativeRequests.find(item => item.kind === 'generation' && item.state === 'submitted' && item.jobId === job.jobId && item.sessionId === job.sessionId && item.projectId === job.projectId && item.bindingId === job.bindingId && item.captureId === job.captureId);
+        return native?.kind === 'generation' ? { ...job, nativePreparedRequestId: native.preparedRequestId } : job;
+      }) };
+      if (id === 'native-requests' && method === 'GET') return { requests: db.state.nativeRequests.filter(item => item.sessionId === sessionId && item.projectId === executor.projectId && (item.state === 'pending' || (item.kind === 'prepare' && item.state === 'prepared'))).map(publicReceipt) };
     }
     if (resource === 'direct-jobs') {
       if (!id && method === 'POST') return acceptDirect(db.state, data, credential);
@@ -145,6 +148,7 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
       if (id && method === 'POST' && action) {
         const record = db.state.nativeRequests.find(item => item.requestId === id); check(record, 'NOT_FOUND', 'Request missing', 404);
         check(string(data, 'sessionId') === record.sessionId, 'FORBIDDEN', 'Session mismatch', 403);
+        if (action === 'invalidate') check(credential !== 'control' && credential?.role === 'executor', 'FORBIDDEN', 'Executor required', 403);
         scope(record.sessionId, 'executor', record.projectId); const executor = liveExecutor(record.sessionId);
         return update(db.state, record, action, data, executor);
       }

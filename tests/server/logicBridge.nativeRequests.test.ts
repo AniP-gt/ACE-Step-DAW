@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, appendFile, access } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBridgeService } from '../../server/logic-bridge/service';
@@ -7,9 +8,21 @@ const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { vi.useRealTimers(); for (const close of cleanup.splice(0).reverse()) await close(); });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'logic-bridge-'));
-  cleanup.push(() => rm(root, { recursive: true, force: true }));
-  const service = await createBridgeService({ root, port: 0 });
-  cleanup.push(() => service.close());
+  cleanup.push(async () => { await rm(root, { recursive: true, force: true }); await expect(access(root)).rejects.toThrow(); if (process.env.BRIDGE_TEST_RESOURCE_LOG) await appendFile(process.env.BRIDGE_TEST_RESOURCE_LOG, JSON.stringify({ phase: 'root-absent', root }) + '\n'); });
+  const reserve = createServer();
+  await new Promise<void>((resolve, reject) => { reserve.once('error', reject); reserve.listen(0, '127.0.0.1', resolve); });
+  const address = reserve.address(); if (!address || typeof address === 'string') throw new Error('Missing port');
+  const port = address.port;
+  if (process.env.BRIDGE_TEST_RESOURCE_LOG) await appendFile(process.env.BRIDGE_TEST_RESOURCE_LOG, JSON.stringify({ phase: 'registered', root, port }) + '\n');
+  await new Promise<void>((resolve, reject) => reserve.close(error => error ? reject(error) : resolve()));
+  const service = await createBridgeService({ root, port });
+  cleanup.push(async () => {
+    await service.close();
+    const probe = createServer();
+    await new Promise<void>((resolve, reject) => { probe.once('error', reject); probe.listen(port, '127.0.0.1', resolve); });
+    await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
+    if (process.env.BRIDGE_TEST_RESOURCE_LOG) await appendFile(process.env.BRIDGE_TEST_RESOURCE_LOG, JSON.stringify({ phase: 'rebound', root, port }) + '\n');
+  });
   return service;
 }
 import { createHash } from 'node:crypto';
@@ -62,6 +75,7 @@ it('prepares a reference and submits a deduplicated native intent only after exe
   expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toEqual([]);
   const submitted = await json(await api(service, executor.token, `/native-requests/${pending.requestId}/submit`, { sessionId: source.sessionId }));
   expect(submitted.state).toBe('submitted'); expect(submitted.jobId).toBeTruthy(); expect(submitted.prompt).toBe('Add an instrumental layer');
+  expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toEqual([expect.objectContaining({ jobId: submitted.jobId, nativePreparedRequestId: first.requestId })]);
   expect((await json(await api(service, executor.token, `/native-requests/${pending.requestId}/submit`, { sessionId: source.sessionId }))).jobId).toBe(submitted.jobId);
   expect((await json(await api(service, source.token, '/native-requests', intent))).requestId).toBe(pending.requestId);
 });
@@ -86,4 +100,90 @@ it('checks capabilities, prompt bounds, poll lease and queued cancellation', asy
   const submitted = await json(await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId })); expect(submitted.state).toBe('submitted');
   await api(service, source.token, `/native-requests/${intent.requestId}/cancel`, {});
   const job = await json(await api(service, executor.token, `/jobs/${submitted.jobId}`)); expect(job.state).toBe('canceled'); expect(job.backendOccupancy).toBe('released');
+});
+
+it('invalidates prepared references idempotently and prevents a linked intent from creating a job', async () => {
+  const service = await fixture(); const source = await captured(service); const executor = await paired(service, 'executor', source.sessionId);
+  await api(service, executor.token, '/executor/register', { sessionId: source.sessionId, projectId: 'project-a', executorId: 'executor-a', modelId: 'base', instruments: ['piano'], outputSemantics: 'isolated-layer' });
+  const prep = await json(await api(service, source.token, '/native-requests', { sessionId: source.sessionId, kind: 'prepare', clientRequestId: 'p', captureId: source.capture.captureId }));
+  const binding = await json(await api(service, executor.token, '/bindings', { sessionId: source.sessionId, projectId: 'project-a', captureId: source.capture.captureId, clipId: 'clip', clientRequestId: 'bind' }));
+  await api(service, executor.token, `/native-requests/${prep.requestId}/prepared`, { sessionId: source.sessionId, bindingId: binding.bindingId });
+  const intent = await json(await api(service, source.token, '/native-requests', { sessionId: source.sessionId, kind: 'generation', clientRequestId: 'g', preparedRequestId: prep.requestId, instrument: 'piano' }));
+  expect((await json(await api(service, executor.token, `/executor/native-requests?sessionId=${source.sessionId}`))).requests).toEqual(expect.arrayContaining([expect.objectContaining({ requestId: prep.requestId, state: 'prepared' })]));
+  const body = { sessionId: source.sessionId, error: 'STALE_BINDING' };
+  expect((await api(service, source.token, `/native-requests/${prep.requestId}/invalidate`, body)).status).toBe(403);
+  expect((await api(service, executor.token, `/native-requests/${prep.requestId}/invalidate`, body)).status).toBe(200);
+  expect((await api(service, executor.token, `/native-requests/${prep.requestId}/invalidate`, body)).status).toBe(200);
+  expect((await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId })).status).toBe(409);
+  expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toEqual([]);
+  expect(await json(await api(service, source.token, `/native-readiness?sessionId=${source.sessionId}`))).toMatchObject({ ready: false, reason: 'STALE_BINDING' });
+});
+
+it('does not fall back to an older prepared reference after the latest preparation fails', async () => {
+  const service = await fixture(); const source = await captured(service); const executor = await paired(service, 'executor', source.sessionId);
+  await api(service, executor.token, '/executor/register', { sessionId: source.sessionId, projectId: 'project-a', executorId: 'executor-a', modelId: 'base', instruments: ['piano'], outputSemantics: 'isolated-layer' });
+  const prepare = { sessionId: source.sessionId, kind: 'prepare', captureId: source.capture.captureId };
+  const first = await json(await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'first' }));
+  const binding = await json(await api(service, executor.token, '/bindings', { sessionId: source.sessionId, projectId: 'project-a', captureId: source.capture.captureId, clipId: 'clip', clientRequestId: 'binding' }));
+  await api(service, executor.token, `/native-requests/${first.requestId}/prepared`, { sessionId: source.sessionId, bindingId: binding.bindingId });
+  const second = await json(await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'second' }));
+  await api(service, executor.token, `/native-requests/${second.requestId}/fail`, { sessionId: source.sessionId, error: 'IMPORT_FAILED' });
+  expect(await json(await api(service, source.token, `/native-readiness?sessionId=${source.sessionId}`))).toMatchObject({ ready: false, preparedRequestId: second.requestId, reason: 'IMPORT_FAILED' });
+  expect((await api(service, service.controlToken, `/native-requests/${first.requestId}/invalidate`, { sessionId: source.sessionId, error: 'STALE_BINDING' })).status).toBe(403);
+});
+
+
+async function preparedFixture() {
+  const service = await fixture(); const source = await captured(service); const executor = await paired(service, 'executor', source.sessionId);
+  await api(service, executor.token, '/executor/register', { sessionId: source.sessionId, projectId: 'project-a', executorId: 'executor-a', modelId: 'base', instruments: ['piano'], outputSemantics: 'isolated-layer' });
+  const prepare = { sessionId: source.sessionId, kind: 'prepare', captureId: source.capture.captureId };
+  const first = await json(await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'first' }));
+  const binding = await json(await api(service, executor.token, '/bindings', { sessionId: source.sessionId, projectId: 'project-a', captureId: source.capture.captureId, clipId: 'clip', clientRequestId: 'binding' }));
+  expect((await api(service, executor.token, `/native-requests/${first.requestId}/prepared`, { sessionId: source.sessionId, bindingId: binding.bindingId })).status).toBe(200);
+  return { service, source, executor, prepare, first };
+}
+
+it.each(['pending', 'failed', 'canceled'] as const)('rejects old references after a newer accepted prepare is %s', async status => {
+  const { service, source, executor, prepare, first } = await preparedFixture();
+  const second = await json(await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'second' }));
+  if (status === 'failed') expect((await api(service, executor.token, `/native-requests/${second.requestId}/fail`, { sessionId: source.sessionId, error: 'IMPORT_FAILED' })).status).toBe(200);
+  if (status === 'canceled') expect((await api(service, source.token, `/native-requests/${second.requestId}/cancel`, {})).status).toBe(200);
+  const response = await api(service, source.token, '/native-requests', { sessionId: source.sessionId, kind: 'generation', clientRequestId: 'new-intent', preparedRequestId: first.requestId, instrument: 'piano' });
+  expect(response.status).toBe(409); expect(await json(response)).toMatchObject({ error: { code: 'STALE_BINDING' } });
+  expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toEqual([]);
+});
+
+it.each(['pending', 'failed', 'canceled'] as const)('does not submit an old pending intent after a replacement is %s and preserves its retry receipt', async status => {
+  const { service, source, executor, prepare, first } = await preparedFixture();
+  const payload = { sessionId: source.sessionId, kind: 'generation', clientRequestId: 'intent', preparedRequestId: first.requestId, instrument: 'piano' };
+  const intent = await json(await api(service, source.token, '/native-requests', payload));
+  const second = await json(await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'second' }));
+  if (status === 'failed') await api(service, executor.token, `/native-requests/${second.requestId}/fail`, { sessionId: source.sessionId, error: 'IMPORT_FAILED' });
+  if (status === 'canceled') await api(service, source.token, `/native-requests/${second.requestId}/cancel`, {});
+  expect((await json(await api(service, source.token, '/native-requests', payload))).requestId).toBe(intent.requestId);
+  const submit = await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId });
+  expect(submit.status).toBe(409); expect(await json(submit)).toMatchObject({ error: { code: 'STALE_BINDING' } });
+  expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toEqual([]);
+});
+
+it('keeps a submitted receipt idempotent after a newer accepted prepare', async () => {
+  const { service, source, executor, prepare, first } = await preparedFixture();
+  const payload = { sessionId: source.sessionId, kind: 'generation', clientRequestId: 'intent', preparedRequestId: first.requestId, instrument: 'piano' };
+  const intent = await json(await api(service, source.token, '/native-requests', payload));
+  const submitted = await json(await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId }));
+  await api(service, source.token, '/native-requests', { ...prepare, clientRequestId: 'second' });
+  expect(await json(await api(service, source.token, '/native-requests', payload))).toMatchObject({ requestId: intent.requestId, state: 'submitted', jobId: submitted.jobId });
+  expect(await json(await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId }))).toMatchObject({ state: 'submitted', jobId: submitted.jobId });
+  expect((await json(await api(service, executor.token, `/executor/jobs?sessionId=${source.sessionId}`))).jobs).toHaveLength(1);
+});
+
+it('keeps the old prepared reference when a replacement was rejected or belongs to another owner', async () => {
+  const { service, source, executor, prepare, first } = await preparedFixture();
+  expect((await api(service, source.token, '/native-requests', { ...prepare, captureId: 'missing', clientRequestId: 'rejected' })).status).toBe(409);
+  const other = await paired(service, 'native', source.sessionId);
+  expect((await api(service, other.token, '/native-requests', { ...prepare, clientRequestId: 'other' })).status).toBe(200);
+  const response = await api(service, source.token, '/native-requests', { sessionId: source.sessionId, kind: 'generation', clientRequestId: 'intent', preparedRequestId: first.requestId, instrument: 'piano' });
+  expect(response.status).toBe(200);
+  const intent = await json(response);
+  expect((await api(service, executor.token, `/native-requests/${intent.requestId}/submit`, { sessionId: source.sessionId })).status).toBe(200);
 });

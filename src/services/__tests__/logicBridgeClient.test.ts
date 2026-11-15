@@ -1,12 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { bridgeRequest, bridgeUrlForPort } from '../logicBridgeClient';
+import { BridgeRequestError, bridgeRequest, bridgeUrlForPort } from '../logicBridgeClient';
 
 describe('bridge HTTP errors', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it('preserves the structured code and exposes only the actionable service message', async () => {
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ error: { code: 'INVALID_PAIRING', message: 'Pairing code invalid or expired', requestId: 'internal-request-identity', retryable: false } }), { status: 401 }));
-    await expect(bridgeRequest('', '/pairings/claim', { code: 'bad' })).rejects.toMatchObject({ code: 'INVALID_PAIRING', message: 'Pairing code invalid or expired' });
+    await expect(bridgeRequest('', '/pairings/claim', { code: 'bad' })).rejects.toMatchObject({ code: 'INVALID_PAIRING', status: 401, message: 'Pairing code invalid or expired' });
+    const error = await bridgeRequest('', '/pairings/claim', { code: 'bad' }).catch(value => value);
+    expect(error).toBeInstanceOf(BridgeRequestError);
+    expect(error).toBeInstanceOf(Error);
+  });
+
+  it('preserves network errors without classifying them as HTTP responses', async () => {
+    const network = new TypeError('offline');
+    vi.stubGlobal('fetch', async () => { throw network; });
+    const error = await bridgeRequest('', '/pairings/claim').catch(value => value);
+    expect(error).toBe(network);
+    expect(error).not.toBeInstanceOf(BridgeRequestError);
   });
 
   it.each(['<html>Internal server trace</html>', '{broken', '{"error":{"requestId":"private"}}'])('uses a safe message for malformed error bodies: %s', async body => {

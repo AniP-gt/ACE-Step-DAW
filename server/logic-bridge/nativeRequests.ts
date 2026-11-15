@@ -28,11 +28,15 @@ function sourceValid(state: BridgeState, record: NativeRequestRecord): boolean {
 function active(executor: Executor | undefined, projectId?: string): executor is Executor {
   return !!executor && Date.now() - executor.seen < 30000 && (!projectId || executor.projectId === projectId);
 }
+function latestPrepare(state: BridgeState, sessionId: string, ownerHash: string): NativeRequestRecord | undefined {
+  return [...state.nativeRequests].reverse().find(record => record.sessionId === sessionId && record.ownerCredentialHash === ownerHash && record.kind === 'prepare');
+}
 export function readiness(state: BridgeState, sessionId: string, ownerHash: string, executor: Executor | undefined): NativeGenerationReadiness {
-  const prepared = [...state.nativeRequests].reverse().find(r => r.sessionId === sessionId && r.ownerCredentialHash === ownerHash && r.kind === 'prepare' && r.state === 'prepared');
+  const prepared = latestPrepare(state, sessionId, ownerHash);
   const instruments = active(executor) ? executor.instruments : [];
   let reason: string | undefined;
   if (!prepared) reason = 'REFERENCE_UNAVAILABLE';
+  else if (prepared.state !== 'prepared') reason = prepared.state === 'failed' ? prepared.error ?? 'REFERENCE_UNAVAILABLE' : 'REFERENCE_UNAVAILABLE';
   else if (!active(executor, prepared.projectId)) reason = 'EXECUTOR_UNAVAILABLE';
   else if (!sourceValid(state, prepared)) reason = 'STALE_BINDING';
   else if (!executor.modelId || !executor.instruments.length) reason = 'LEGO_UNAVAILABLE';
@@ -60,9 +64,9 @@ export function accept(state: BridgeState, data: Record<string, unknown>, creden
     record = { ...common, captureId: capture.captureId, kind: 'prepare', state: 'pending' };
   } else {
     const prepared = owned(state, payload.preparedRequestId, credential);
-    check(prepared.kind === 'prepare' && prepared.state === 'prepared' && prepared.projectId === executor.projectId && sourceValid(state, prepared), 'STALE_BINDING', 'Prepared reference unavailable', 409);
+    check(prepared.kind === 'prepare' && prepared.state === 'prepared' && latestPrepare(state, sessionId, ownerHash)?.requestId === prepared.requestId && prepared.projectId === executor.projectId && sourceValid(state, prepared), 'STALE_BINDING', 'Prepared reference unavailable', 409);
     check(executor.modelId && executor.instruments.includes(payload.instrument), 'LEGO_UNAVAILABLE', 'Compatible model/instrument unavailable', 409);
-    check(!state.jobs.some(job => backendOccupancy(job) !== 'released'), 'BACKEND_BUSY', 'Backend occupied; reconcile before retrying', 409);
+    check(!state.jobs.some(job => backendOccupancy(job) !== 'released') && !state.directCoverJobs.some(job => job.backendOccupancy !== 'released'), 'BACKEND_BUSY', 'Backend occupied; reconcile before retrying', 409);
     const prompt = typeof payload.prompt === 'string' && payload.prompt.trim() ? payload.prompt : 'Add an instrumental layer';
     record = { ...common, captureId: prepared.captureId, kind: 'generation', state: 'pending', preparedRequestId: prepared.requestId, bindingId: prepared.bindingId, instrument: payload.instrument, prompt, jobClientRequestId: randomUUID() };
   }
@@ -90,11 +94,20 @@ export function update(state: BridgeState, record: NativeRequestRecord, action: 
     } else if (action === 'submit') {
       check(record.kind === 'generation', 'INVALID_TRANSITION', 'Expected generation', 409);
       if (record.state !== 'submitted') {
-        check(record.state === 'pending' && sourceValid(state, record), 'STALE_BINDING', 'Reference unavailable', 409);
+        const parent = latestPrepare(state, record.sessionId, record.ownerCredentialHash);
+        check(record.state === 'pending' && parent?.kind === 'prepare' && parent.requestId === record.preparedRequestId && parent.state === 'prepared' && parent.sessionId === record.sessionId && parent.projectId === record.projectId && parent.captureId === record.captureId && parent.bindingId === record.bindingId && sourceValid(state, parent) && sourceValid(state, record), 'STALE_BINDING', 'Reference unavailable', 409);
         const source = state.captures.find(c => c.captureId === record.captureId && c.sessionId === record.sessionId);
         check(source?.canonicalFrameCount, 'SOURCE_UNAVAILABLE', 'Capture unavailable', 409);
         const job = createJob({ sessionId: record.sessionId, projectId: record.projectId, captureId: record.captureId, bindingId: record.bindingId, clientRequestId: record.jobClientRequestId, instrument: record.instrument, prompt: record.prompt, modelId: executor.modelId, startFrame: 0, endFrame: source.canonicalFrameCount }, state, executor);
         next = { ...record, state: 'submitted', jobId: job.jobId };
+      }
+    } else if (action === 'invalidate') {
+      check(record.kind === 'prepare' && data.error === 'STALE_BINDING', 'INVALID_TRANSITION', 'Expected stale preparation', 409);
+      if (record.state === 'failed') check(record.error === 'STALE_BINDING', 'INVALID_TRANSITION', 'Preparation is closed', 409);
+      else {
+        check(record.state === 'prepared', 'INVALID_TRANSITION', 'Expected prepared reference', 409);
+        next = { ...record, state: 'failed', error: 'STALE_BINDING' };
+        state.nativeRequests = state.nativeRequests.map(item => item.kind === 'generation' && item.state === 'pending' && item.preparedRequestId === record.requestId ? { ...item, state: 'failed', error: 'STALE_BINDING' } : item);
       }
     } else if (action === 'fail') {
       check(record.state === 'pending', 'INVALID_TRANSITION', 'Request is closed', 409);
