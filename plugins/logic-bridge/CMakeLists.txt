@@ -33,3 +33,7 @@ endif()
 add_executable(result_catalog_test tests/result_catalog_test.cpp)
 target_include_directories(result_catalog_test PRIVATE src)
 add_test(NAME result_catalog COMMAND result_catalog_test)
+
+add_executable(generation_state_test tests/generation_state_test.cpp)
+target_include_directories(generation_state_test PRIVATE src)
+add_test(NAME generation_state COMMAND generation_state_test)
