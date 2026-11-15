@@ -127,3 +127,19 @@ export interface BridgeResultPage {
   readonly results: readonly BridgeResultSummary[];
   readonly nextBeforeResultId: string | null;
 }
+
+/** Direct Cover jobs are owned by one native credential and share backend occupancy with DAW jobs. */
+export interface DirectCoverJob {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly captureId: string;
+  readonly clientRequestId: string;
+  readonly ownerCredentialHash: string;
+  readonly payloadFingerprint: string;
+  readonly prompt: string;
+  readonly state: 'queued' | 'running' | 'ready' | 'failed' | 'interrupted';
+  readonly backendOccupancy: 'reserved' | 'occupied' | 'unknown' | 'released';
+  readonly backendTaskId?: string;
+  readonly resultId?: string;
+  readonly error?: string;
+}

@@ -8,6 +8,7 @@ import { appendChunk, createCapture, finalize, reservedCaptureBytes } from './ca
 import { binding, createJob, transition, backendOccupancy, type Executor } from './jobs';
 import { hash, validateResult } from './audio';
 import { accept, owned, owner, publicReceipt, readiness, update } from './nativeRequests';
+import { acceptDirect, directReceipt, ownedDirect } from './directCover';
 export interface RouteRequest {
   readonly method: string;
   readonly url: URL;
@@ -111,6 +112,22 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
       if (id === 'jobs' && method === 'GET') return { jobs: db.state.jobs.filter(job => job.sessionId === sessionId && job.projectId === executor.projectId && (backendOccupancy(job) !== 'released' || job.state === 'canceled')) };
       if (id === 'native-requests' && method === 'GET') return { requests: db.state.nativeRequests.filter(item => item.sessionId === sessionId && item.projectId === executor.projectId && item.state === 'pending').map(publicReceipt) };
     }
+    if (resource === 'direct-jobs') {
+      if (!id && method === 'POST') return acceptDirect(db.state, data, credential);
+      if (!id && method === 'GET') {
+        const sessionId = url.searchParams.get('sessionId') ?? ''; const ownerHash = owner(credential, sessionId);
+        const clientRequestId = string({ clientRequestId: url.searchParams.get('clientRequestId') }, 'clientRequestId');
+        const job = db.state.directCoverJobs.find(item => item.sessionId === sessionId && item.ownerCredentialHash === ownerHash && item.clientRequestId === clientRequestId);
+        check(job, 'NOT_FOUND', 'Direct generation not found', 404); return directReceipt(job);
+      }
+      if (id && method === 'GET' && !action) return directReceipt(ownedDirect(db.state, id, credential));
+      if (id && method === 'POST' && action === 'reconcile') {
+        check(credential === 'control' && data.backendStopped === true, 'FORBIDDEN', 'Control verification of backend shutdown required', 403);
+        const index = db.state.directCoverJobs.findIndex(item => item.requestId === id); check(index >= 0, 'NOT_FOUND', 'Direct generation not found', 404);
+        const job = db.state.directCoverJobs[index]; check(job.state === 'interrupted' && job.backendOccupancy === 'unknown', 'INVALID_TRANSITION', 'Only interrupted unknown jobs can be reconciled', 409);
+        db.state.directCoverJobs[index] = { ...job, backendOccupancy: 'released', error: 'Backend stopped; direct generation interrupted' }; return directReceipt(db.state.directCoverJobs[index]);
+      }
+    }
     if (resource === 'native-readiness' && method === 'GET' && !id) {
       const sessionId = url.searchParams.get('sessionId') ?? ''; return readiness(db.state, sessionId, owner(credential, sessionId), executors.get(sessionId));
     }
@@ -190,7 +207,8 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
       const limitValue = url.searchParams.get('limit');
       check(limitValue === null || (/^\d+$/.test(limitValue) && Number.isSafeInteger(Number(limitValue)) && Number(limitValue) >= 1 && Number(limitValue) <= 100), 'INVALID_LIMIT', 'Limit must be an integer from 1 to 100');
       const limit = limitValue === null ? 50 : Number(limitValue);
-      const jobs = new Map(db.state.jobs.filter(job => job.sessionId === sessionId && job.state === 'ready').map(job => [job.jobId, job]));
+      const jobs = new Map(db.state.jobs.filter(job => job.sessionId === sessionId && job.state === 'ready').map(job => [job.jobId, { resultId: job.resultId, instrument: job.instrument }]));
+      for (const job of db.state.directCoverJobs) if (job.sessionId === sessionId && job.state === 'ready') jobs.set(job.requestId, { resultId: job.resultId, instrument: 'Cover' });
       const summaries: BridgeResultSummary[] = [];
       let publicationOrder = 0;
       for (const result of db.state.results) {

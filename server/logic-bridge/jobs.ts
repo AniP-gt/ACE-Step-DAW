@@ -38,6 +38,8 @@ export function createJob(data: Record<string, unknown>, state: BridgeState, exe
   check(proposed.startFrame >= 0 && proposed.endFrame > proposed.startFrame && proposed.endFrame <= source.canonicalFrameCount, 'INVALID_RANGE', 'Invalid canonical range');
   check(executor && executor.projectId === proposed.projectId && Date.now() - executor.seen < 30000, 'EXECUTOR_UNAVAILABLE', 'Project executor is offline', 409);
   check(executor.modelId === proposed.modelId && executor.instruments.includes(proposed.instrument), 'LEGO_UNAVAILABLE', 'Compatible model/instrument unavailable', 409);
+  const directOccupied = state.directCoverJobs.find(job => job.backendOccupancy !== 'released');
+  check(!directOccupied, directOccupied?.backendOccupancy === 'unknown' ? 'BACKEND_OUTCOME_UNKNOWN' : 'PROJECT_BUSY', 'Direct Cover occupies the backend', 409);
   const occupied = state.jobs.find(job => backendOccupancy(job) !== 'released');
   check(!occupied, occupied && backendOccupancy(occupied) === 'unknown' ? 'BACKEND_OUTCOME_UNKNOWN' : 'PROJECT_BUSY', occupied ? `Backend occupied by job ${occupied.jobId}; reconcile its terminal backend status before retrying` : 'Backend is busy', 409);
   const job: BridgeJob = { ...proposed, jobId: randomUUID(), parameterHash, canonicalSha256: source.canonicalSha256, state: 'queued', backendOccupancy: 'reserved' };

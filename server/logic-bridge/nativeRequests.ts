@@ -36,7 +36,7 @@ export function readiness(state: BridgeState, sessionId: string, ownerHash: stri
   else if (!active(executor, prepared.projectId)) reason = 'EXECUTOR_UNAVAILABLE';
   else if (!sourceValid(state, prepared)) reason = 'STALE_BINDING';
   else if (!executor.modelId || !executor.instruments.length) reason = 'LEGO_UNAVAILABLE';
-  else if (state.jobs.some(job => backendOccupancy(job) !== 'released')) reason = 'BACKEND_BUSY';
+  else if (state.jobs.some(job => backendOccupancy(job) !== 'released') || state.directCoverJobs.some(job => job.backendOccupancy !== 'released')) reason = 'BACKEND_BUSY';
   return { preparedRequestId: prepared?.requestId ?? null, ready: !reason, ...(reason ? { reason } : {}), instruments };
 }
 export function owned(state: BridgeState, id: string, credential: BridgeCredential | 'control' | undefined): NativeRequestRecord {

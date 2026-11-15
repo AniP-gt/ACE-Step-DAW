@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, rename, appendFile, open, unlink, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import type { BridgeCapture, BridgeCredential, BridgeJob, BridgeResult, BridgeSession, ContextBinding, NativeRequestRecord } from '../../shared/logic-bridge/types';
+import type { BridgeCapture, BridgeCredential, BridgeJob, BridgeResult, BridgeSession, ContextBinding, NativeRequestRecord, DirectCoverJob } from '../../shared/logic-bridge/types';
 import { BridgeError } from './validation';
 import { hash } from './audio';
 export interface BridgeState {
@@ -12,6 +12,7 @@ export interface BridgeState {
   jobs: BridgeJob[];
   results: BridgeResult[];
   nativeRequests: NativeRequestRecord[];
+  directCoverJobs: DirectCoverJob[];
   assets: { assetId: string; sessionId: string; sha256: string; size: number }[];
 }
 export async function storage(root: string) {
@@ -33,9 +34,13 @@ export async function storage(root: string) {
     try { state = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')); }
     catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
-      state = { sessions: [], credentials: [], captures: [], bindings: [], jobs: [], results: [], nativeRequests: [], assets: [] };
+      state = { sessions: [], credentials: [], captures: [], bindings: [], jobs: [], results: [], nativeRequests: [], directCoverJobs: [], assets: [] };
     }
     state.nativeRequests ??= [];
+    state.directCoverJobs ??= [];
+    state.directCoverJobs = state.directCoverJobs.map(job => job.state === 'queued'
+      ? { ...job, state: 'interrupted', error: 'SERVICE_RESTARTED_BEFORE_SUBMISSION', backendOccupancy: 'released' }
+      : job.state === 'running' ? { ...job, state: 'interrupted', error: 'SUBMISSION_OUTCOME_UNKNOWN', backendOccupancy: 'unknown' } : job);
     const save = async () => {
       const temporary = join(root, `${randomUUID()}.tmp`);
       await writeFile(temporary, JSON.stringify(state), { mode: 0o600 });
@@ -51,6 +56,10 @@ export async function storage(root: string) {
     }
     state.captures = state.captures.map(capture => capture.state === 'ready' && (invalidAssets.has(capture.canonicalAssetId ?? '') || invalidAssets.has(capture.originalAssetId ?? '')) ? { ...capture, state: 'failed' } : capture);
     state.jobs = state.jobs.map(job => {
+      const result = state.results.find(item => item.resultId === job.resultId);
+      return job.state === 'ready' && (!result || invalidAssets.has(result.assetId)) ? { ...job, state: 'failed', error: 'RESULT_UNAVAILABLE' } : job;
+    });
+    state.directCoverJobs = state.directCoverJobs.map(job => {
       const result = state.results.find(item => item.resultId === job.resultId);
       return job.state === 'ready' && (!result || invalidAssets.has(result.assetId)) ? { ...job, state: 'failed', error: 'RESULT_UNAVAILABLE' } : job;
     });
