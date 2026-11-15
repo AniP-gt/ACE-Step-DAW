@@ -180,9 +180,11 @@ async function attachCapture(request: BridgeObject): Promise<BridgeObject> {
   } });
   const importedTrack = useProjectStore.getState().project?.tracks.find(track => track.id === imported.trackId);
   if (!importedTrack) throw new ExplicitContextError('Reference track was removed.');
+  referenceImports.set(receiptKey, { track: importedTrack, completed: false });
+  await set(journalKey, { track: importedTrack, completed: false });
+  await flushProjectReferencePersistence(projectId);
   referenceImports.set(receiptKey, { track: importedTrack, completed: true });
   await set(journalKey, { track: importedTrack, completed: true });
-  await flushProjectReferencePersistence(projectId);
   boundConnection(sessionId, projectId);
   await set(receiptKey, imported.clipId);
   referenceImports.delete(receiptKey);

@@ -1,19 +1,25 @@
 import 'fake-indexeddb/auto';
 import { File as NodeFile } from 'node:buffer';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { useProjectStore } from '../../store/projectStore';
+import { flushProjectReferencePersistence, useProjectStore } from '../../store/projectStore';
 import { useLogicBridgeStore } from '../../store/logicBridgeStore';
 import { attachLogicCapture } from '../logicBridge';
 import * as audio from '../audioFileManager';
 import * as waveform from '../../utils/waveformPeaks';
 import * as storage from '../projectStorage';
+import { get } from 'idb-keyval';
 
-const fixture = vi.hoisted(() => ({ bindings: [] as Record<string, unknown>[], failBinding: false, failReceipt: false, failJournalAt: 0, journalWrites: 0 }));
+const fixture = vi.hoisted(() => ({ bindings: [] as Record<string, unknown>[], failBinding: false, failReceipt: false, failJournalAt: 0, journalWrites: 0, stopAfterCompleted: false }));
 vi.mock('idb-keyval', async (importOriginal) => {
   const actual = await importOriginal<typeof import('idb-keyval')>();
   return { ...actual, set: async (key: IDBValidKey, value: unknown) => {
     if (typeof key === 'string' && key.startsWith('logic-bridge:attach:') && fixture.failReceipt) { fixture.failReceipt = false; throw new Error('receipt failed'); }
     if (typeof key === 'string' && key.startsWith('logic-bridge:attach-operation:') && ++fixture.journalWrites === fixture.failJournalAt) throw new Error('journal failed');
+    if (typeof key === 'string' && key.startsWith('logic-bridge:attach-operation:') && fixture.stopAfterCompleted && typeof value === 'object' && value !== null && 'completed' in value && value.completed === true) {
+      fixture.stopAfterCompleted = false;
+      await actual.set(key, value);
+      throw new Error('simulated power loss');
+    }
     return actual.set(key, value);
   } };
 });
@@ -30,8 +36,8 @@ vi.mock('../logicBridgeClient', async (importOriginal) => {
 });
 
 describe('reference import recovery', () => {
-  beforeEach(() => { vi.stubGlobal('File', NodeFile); fixture.bindings = []; fixture.failBinding = false; fixture.failReceipt = false; fixture.failJournalAt = 0; fixture.journalWrites = 0; useProjectStore.getState().createProject({ bpm: 120 }); const projectId = useProjectStore.getState().project!.id; useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: 'token', sessionId: 'session', projectId }); });
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  beforeEach(() => { vi.stubGlobal('File', NodeFile); fixture.bindings = []; fixture.failBinding = false; fixture.failReceipt = false; fixture.failJournalAt = 0; fixture.journalWrites = 0; fixture.stopAfterCompleted = false; useProjectStore.getState().createProject({ bpm: 120 }); const projectId = useProjectStore.getState().project!.id; useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: 'token', sessionId: 'session', projectId }); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
   const request = () => ({ sessionId: 'session', projectId: useProjectStore.getState().project!.id, captureId: 'capture', clientRequestId: 'request' });
   it.each([1, 2])('does not duplicate a reference after journal write %i fails with an existing binding', async (failedWrite) => {
     const req = request();
@@ -92,6 +98,40 @@ describe('reference import recovery', () => {
     await attachLogicCapture(request());
     expect(fixture.bindings).toHaveLength(1);
     expect(useProjectStore.getState().project!.tracks.flatMap(track => track.clips)).toHaveLength(1);
+  });
+  it('recovers a reference after interruption before project durability without changing existing clips', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const req = request();
+    const track = useProjectStore.getState().addTrack('custom', 'sample');
+    const oldClip = useProjectStore.getState().addClip(track.id, { startTime: 0, duration: 1, prompt: 'existing', lyrics: '' });
+    fixture.bindings = [{ sessionId: 'session', projectId: req.projectId, captureId: 'old', clipId: oldClip.id, bindingId: 'old-binding' }];
+    await flushProjectReferencePersistence(req.projectId);
+    const durableBefore = await storage.loadProject(req.projectId);
+    expect(durableBefore?.tracks.flatMap(item => item.clips).map(clip => clip.id)).toEqual([oldClip.id]);
+
+    fixture.stopAfterCompleted = true;
+    const save = vi.spyOn(storage, 'saveProject').mockRejectedValue(new Error('project save failed'));
+    await expect(attachLogicCapture(req)).rejects.toThrow(/simulated power loss|project save failed/);
+    const journalKey = `logic-bridge:attach-operation:session:${req.projectId}:capture`;
+    const journal = await get<{ completed?: boolean }>(journalKey);
+    expect(journal?.completed).not.toBe(true);
+    expect(fixture.bindings).toHaveLength(1);
+    expect((await storage.loadProject(req.projectId))?.tracks.flatMap(item => item.clips).map(clip => clip.id)).toEqual([oldClip.id]);
+
+    save.mockRestore();
+    fixture.stopAfterCompleted = false;
+    vi.clearAllTimers();
+    vi.resetModules();
+    const { useProjectStore: reloadedStore } = await import('../../store/projectStore');
+    const { useLogicBridgeStore: reloadedBridge } = await import('../../store/logicBridgeStore');
+    reloadedStore.setState({ project: durableBefore });
+    reloadedBridge.setState({ ...reloadedBridge.getInitialState(), connected: true, token: 'token', sessionId: 'session', projectId: req.projectId });
+    const { attachLogicCapture: reloadedAttach } = await import('../logicBridge');
+    await reloadedAttach(req);
+    const clips = reloadedStore.getState().project!.tracks.flatMap(item => item.clips);
+    expect(clips).toHaveLength(2);
+    expect(clips.find(clip => clip.id === oldClip.id)?.prompt).toBe('existing');
+    expect(fixture.bindings).toHaveLength(2);
   });
   it.each(['save', 'receipt'])('recovers %s failure after a page reload', async (failure) => {
     if (failure === 'save') vi.spyOn(audio, 'saveAudioBlob').mockRejectedValueOnce(new Error('save failed'));
