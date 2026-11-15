@@ -9,6 +9,8 @@
 #include "../src/ResultDragButton.h"
 #include "../src/ResultCatalogView.h"
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter();
+juce::AudioProcessor* createBridgeProbeProcessor(int port);
+int bridgeProbePort(juce::AudioProcessor&);
 class Playhead final:public juce::AudioPlayHead {
 public:
  int64_t frame=0;
@@ -91,6 +93,28 @@ static bool dragGestureChecks() {
 }
 int main(int argc,char** argv) {
  juce::ScopedJuceInitialiser_GUI init;
+ if(argc==2 && juce::String(argv[1])=="--endpoint-self-test") {
+  std::unique_ptr<juce::AudioProcessor> production(createPluginFilter());
+  std::unique_ptr<juce::AudioProcessor> fixture(createBridgeProbeProcessor(43210));
+  if(bridgeProbePort(*production)!=5176 || !fixture || bridgeProbePort(*fixture)!=43210 || createBridgeProbeProcessor(0)!=nullptr || createBridgeProbeProcessor(65536)!=nullptr)return 1;
+  std::cout<<"PASS default, injected and invalid endpoint ports\n";return 0;
+ }
+ if(argc==3 && juce::String(argv[1])=="--endpoint-workflow") {
+  const juce::String portText(argv[2]);if(portText.isEmpty() || portText.containsOnly("0123456789")==false || portText.length()>5)return 28;
+  std::unique_ptr<juce::AudioProcessor> fixture(createBridgeProbeProcessor(portText.getIntValue()));if(!fixture)return 29;
+  Playhead head;fixture->setPlayHead(&head);fixture->prepareToPlay(48000,512);juce::AudioBuffer<float> audio(2,512);audio.clear();juce::MidiBuffer midi;
+  bridgeProbeCatalogVisible(*fixture,true);bridgeProbeCommand(*fixture,"pair","fixture");
+  for(int i=0;i<500 && bridgeProbeStatus(*fixture)!="Ready";++i)juce::Thread::sleep(10);if(bridgeProbeStatus(*fixture)!="Ready")return 30;
+  for(int i=0;i<500 && !bridgeProbeCatalog(*fixture).contains("baseline=1");++i)juce::Thread::sleep(10);if(!bridgeProbeCatalog(*fixture).contains("baseline=1"))return 31;
+  bridgeProbeCommand(*fixture,"result","fixture-result");for(int i=0;i<500 && !bridgeProbeStatus(*fixture).startsWith("Result ready:");++i)juce::Thread::sleep(10);if(!bridgeProbeStatus(*fixture).startsWith("Result ready:"))return 32;
+  auto exported=bridgeProbeResult(*fixture);juce::MemoryBlock state;fixture->getStateInformation(state);juce::MemoryInputStream stream(state,false);auto saved=juce::JSON::parse(stream.readString());auto cached=exported.getParentDirectory().getChildFile("verified-cache").getChildFile(saved["cachedFilename"].toString());
+  struct Cleanup {juce::File exported,cached;~Cleanup(){exported.deleteFile();exported.withFileExtension("json").deleteFile();cached.deleteFile();cached.withFileExtension("json").deleteFile();}} cleanup{exported,cached};
+  bridgeProbeCommand(*fixture,"capture","1");for(int i=0;i<500 && !bridgeProbeStatus(*fixture).startsWith("Armed");++i)juce::Thread::sleep(10);if(!bridgeProbeStatus(*fixture).startsWith("Armed"))return 33;
+  for(int i=0;i<100;++i){fixture->processBlock(audio,midi);head.frame+=512;juce::Thread::sleep(10);}
+  for(int i=0;i<500 && !bridgeProbeStatus(*fixture).startsWith("Captured:");++i)juce::Thread::sleep(10);bool success=bridgeProbeStatus(*fixture).startsWith("Captured:");
+  fixture.reset();if(!success)return 34;
+  std::cout<<"PASS loopback pairing, catalog, result, asset and capture workflow\n";return 0;
+ }
  if(!dragGestureChecks())return 27;
  std::unique_ptr<juce::AudioProcessor> p(createPluginFilter());Playhead head;p->setPlayHead(&head);p->prepareToPlay(48000,512);
  juce::AudioBuffer<float> audio(2,512);juce::MidiBuffer midi;

@@ -10,7 +10,7 @@
 
 class BridgeProcessor final : public juce::AudioProcessor, private juce::Thread {
 public:
- BridgeProcessor(): AudioProcessor(BusesProperties().withInput("Input",juce::AudioChannelSet::stereo(),true).withOutput("Output",juce::AudioChannelSet::stereo(),true)), Thread("ACE Bridge worker") { startThread(); catalogThread=std::thread([this]{catalogLoop();}); }
+ explicit BridgeProcessor(unsigned short port=5176): AudioProcessor(BusesProperties().withInput("Input",juce::AudioChannelSet::stereo(),true).withOutput("Output",juce::AudioChannelSet::stereo(),true)), Thread("ACE Bridge worker"), bridgePort(port) { startThread(); catalogThread=std::thread([this]{catalogLoop();}); }
  ~BridgeProcessor() override { {std::lock_guard<std::mutex> lock(mutex);catalogStop=true;}catalogWake.notify_one();catalogRequestStop.stop();if(catalogThread.joinable())catalogThread.join();signalThreadShouldExit(); stopThread(-1); }
  const juce::String getName() const override { return "ACE-Step Bridge"; }
  void prepareToPlay(double rate,int) override { sampleRate.store(rate); }
@@ -36,6 +36,7 @@ public:
  void setStateInformation(const void* data,int bytes) override { juce::MemoryInputStream s(data,static_cast<size_t>(bytes),false);auto saved=juce::JSON::parse(s.readString());if(!saved.isObject())return;std::lock_guard<std::mutex> lock(mutex);stateId=saved["stateId"].toString();sessionDisplay=saved["sessionDisplay"].toString();captureSeconds=juce::jlimit(1,120,static_cast<int>(saved["captureSeconds"]));savedResultId=saved["resultId"].toString();cachedFilename=saved["cachedFilename"].toString();cacheVersion=static_cast<int>(saved["cacheVersion"]);++selectionRevision;++stateRevision;catalog.restore();catalogWake.notify_one();credentialsResetRequested=true;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;localResult=juce::File();placementText.clear();if(pending=="capture")captureReserved=false;pending.clear();argument.clear();if(!cachedFilename.isEmpty()){pending="restore";argument.clear();message="Restoring cached result";}else message="Disconnected"; }
  void command(juce::String op,juce::String arg={}) {std::lock_guard<std::mutex> lock(mutex);if(op=="result" && captureReserved)return;if(op=="capture"){if(captureReserved)return;captureReserved=true;captureSeconds=juce::jlimit(1,120,arg.getIntValue());}else if(pending=="capture")captureReserved=false;if(op=="result"){savedResultId=arg;cachedFilename.clear();cacheVersion=1;localResult=juce::File();placementText.clear();++selectionRevision;message="Fetching result";}pending=op;argument=arg;pendingRevision=selectionRevision;pendingStateRevision=stateRevision;}
  void catalogVisible(bool visible) {std::lock_guard<std::mutex> lock(mutex);catalog.setVisible(visible);if(visible)catalog.refresh();catalogWake.notify_one();}
+ int port() const {return bridgePort;}
  int catalogQos() const {return catalogQosValue.load();}
  void catalogRefresh() {std::lock_guard<std::mutex> lock(mutex);catalog.refresh();catalogWake.notify_one();}
  void catalogOlder(const std::string& cursor) {std::lock_guard<std::mutex> lock(mutex);catalog.older(cursor);catalogWake.notify_one();}
@@ -50,6 +51,7 @@ public:
  juce::String placement(){std::lock_guard<std::mutex> lock(mutex);return placementText;}
  juce::File result() {std::lock_guard<std::mutex> lock(mutex);return localResult;}
 private:
+ const unsigned short bridgePort;
  ResultCatalogState catalog;ResultCatalogClient::StopControl catalogRequestStop;
  std::thread catalogThread;std::condition_variable catalogWake;bool catalogStop=false;std::atomic<int> catalogQosValue{-1};
  void catalogLoop() {
@@ -66,7 +68,7 @@ private:
   while(!catalogStop) {
    if(catalog.visible() && catalog.paired() && std::chrono::steady_clock::now()>=next){catalog.refresh();next=std::chrono::steady_clock::time_point::max();}
    auto request=catalog.begin();
-   if(request){lock.unlock();auto page=ResultCatalogClient::fetch(*request,catalogRequestStop);lock.lock();if(page)catalog.succeed(*request,std::move(*page));else catalog.fail(*request);next=std::chrono::steady_clock::now()+std::chrono::seconds(catalog.retrySeconds());continue;}
+   if(request){lock.unlock();auto page=ResultCatalogClient::fetch(*request,catalogRequestStop,bridgePort);lock.lock();if(page)catalog.succeed(*request,std::move(*page));else catalog.fail(*request);next=std::chrono::steady_clock::now()+std::chrono::seconds(catalog.retrySeconds());continue;}
    if(catalog.visible() && catalog.paired() && next!=std::chrono::steady_clock::time_point::max())catalogWake.wait_until(lock,next);else catalogWake.wait(lock);
   }
  }
@@ -84,7 +86,7 @@ private:
  void show(juce::String s) {std::lock_guard<std::mutex> lock(mutex);message=s;}
  juce::var request(juce::String method,juce::String path,juce::var body={},const juce::MemoryBlock* binary=nullptr,juce::String extra={}) {
   networkRequests.fetch_add(1);
-  juce::URL url("http://127.0.0.1:5176/v1"+path);
+  juce::URL url("http://127.0.0.1:"+juce::String(bridgePort)+"/v1"+path);
   if(binary) url=url.withPOSTData(*binary); else if(!body.isVoid()) url=url.withPOSTData(juce::JSON::toString(body));
   int code=0;
   auto headers="X-Bridge-Protocol: 1\r\nAuthorization: Bearer "+token+"\r\nContent-Type: "+(binary?juce::String("application/octet-stream"):juce::String("application/json"))+"\r\n"+extra;
@@ -133,7 +135,7 @@ private:
   auto asset=metadata["audioAssetId"].toString(); if(asset.isEmpty()) asset=metadata["assetId"].toString();
   if(asset.isEmpty()) throw juce::String("Result has no audio asset");
   networkRequests.fetch_add(1);
-  int code=0;juce::URL url("http://127.0.0.1:5176/v1/assets/"+asset);
+  int code=0;juce::URL url("http://127.0.0.1:"+juce::String(bridgePort)+"/v1/assets/"+asset);
   auto stream=url.createInputStream(juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress).withExtraHeaders("Authorization: Bearer "+token+"\r\n").withConnectionTimeoutMs(3000).withStatusCode(&code).withNumRedirectsToFollow(0));
   if(!stream || code!=200) throw juce::String("Result download failed");
   juce::MemoryBlock bytes; constexpr size_t maxBytes=64*1024*1024; std::array<char,65536> block{}; while(!stream->isExhausted()){auto n=stream->read(block.data(),static_cast<int>(block.size()));if(n<=0)break;if(bytes.getSize()+static_cast<size_t>(n)>maxBytes)throw juce::String("Result exceeds 64 MiB limit");bytes.append(block.data(),static_cast<size_t>(n));}
@@ -240,6 +242,8 @@ private:
 juce::AudioProcessorEditor* BridgeProcessor::createEditor(){return new BridgeEditor(*this);}
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new BridgeProcessor();}
 
+juce::AudioProcessor* createBridgeProbeProcessor(int port){if(port<1 || port>65535)return nullptr;return new BridgeProcessor(static_cast<unsigned short>(port));}
+int bridgeProbePort(juce::AudioProcessor& p){return static_cast<BridgeProcessor&>(p).port();}
 void bridgeProbeCommand(juce::AudioProcessor& p,const juce::String& op,const juce::String& arg){static_cast<BridgeProcessor&>(p).command(op,arg);}
 juce::String bridgeProbeStatus(juce::AudioProcessor& p){return static_cast<BridgeProcessor&>(p).status();}
 

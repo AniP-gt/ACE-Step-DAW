@@ -2,7 +2,15 @@ import { BRIDGE_PORT, BRIDGE_PROTOCOL } from '../../shared/logic-bridge/types';
 import { ExplicitContextError } from './explicitContextGeneration';
 import { useLogicBridgeStore } from '../store/logicBridgeStore';
 
-export const BRIDGE_URL = `http://127.0.0.1:${BRIDGE_PORT}/v1`;
+export function bridgeUrlForPort(value: string | undefined): string {
+  if (value === undefined) return `http://127.0.0.1:${BRIDGE_PORT}/v1`;
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+    throw new Error('Invalid VITE_LOGIC_BRIDGE_PORT');
+  }
+  return `http://127.0.0.1:${Number(value)}/v1`;
+}
+
+export const BRIDGE_URL = bridgeUrlForPort(import.meta.env.VITE_LOGIC_BRIDGE_PORT);
 export type BridgeObject = Record<string, unknown>;
 
 export class BridgeRequestError extends Error {
