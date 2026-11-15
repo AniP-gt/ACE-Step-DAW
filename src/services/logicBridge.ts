@@ -1,4 +1,4 @@
-import { useProjectStore } from '../store/projectStore';
+import { flushProjectReferencePersistence, useProjectStore } from '../store/projectStore';
 import { useModelStore } from '../store/modelStore';
 import { useLogicBridgeStore } from '../store/logicBridgeStore';
 import { useGenerationStore } from '../store/generationStore';
@@ -7,12 +7,21 @@ import { ExplicitContextError, requireLegoModel, validateContextRange } from './
 import { bridgeJson, canonicalBlob, numberField, objects, stringField, type BridgeObject } from './logicBridgeClient';
 import { runBridgeJob } from './logicBridgeExecutor';
 import { TRACK_NAMES } from '../constants/tracks';
-import { get, set } from 'idb-keyval';
+import { del, get, set } from 'idb-keyval';
 import { reconcileBridgeJob } from './logicBridgeReconciliation';
 import { applyLogicReferenceTiming } from './logicBridgeTiming';
 
 let stopExecutor: (() => void) | undefined;
 let attachingCapture = false;
+const referenceImports = new Map<string, { track: NonNullable<ReturnType<typeof useProjectStore.getState>['project']>['tracks'][number]; completed: boolean }>();
+
+function referenceTrackSnapshot(track: NonNullable<ReturnType<typeof useProjectStore.getState>['project']>['tracks'][number]): string {
+  return JSON.stringify({ ...track, clips: track.clips.map(clip => ({ ...clip, waveformPeaks: null, versions: clip.versions?.map(version => ({ ...version, waveformPeaks: null })), takes: clip.takes?.map(take => ({ ...take, waveformPeaks: null })) })) });
+}
+
+function referenceInventory(project: NonNullable<ReturnType<typeof useProjectStore.getState>['project']>): string {
+  return JSON.stringify(project.tracks.map(track => [track.id, ...track.clips.map(clip => clip.id).sort()]).sort((a, b) => a[0].localeCompare(b[0])));
+}
 
 export function boundConnection(sessionId: string, projectId: string) {
   const state = useLogicBridgeStore.getState();
@@ -101,16 +110,48 @@ async function attachCapture(request: BridgeObject): Promise<BridgeObject> {
     const source = state.captures.find(item => item.captureId === captureId);
     if (!source) throw new ExplicitContextError('CAPTURE_NOT_READY');
     applyLogicReferenceTiming(source, projectId);
+    await flushProjectReferencePersistence(projectId);
+    boundConnection(sessionId, projectId);
     useLogicBridgeStore.setState({ selectedCaptureId: captureId });
     return previous;
   }
   const capture = state.captures.find(item => item.captureId === captureId && item.state === 'ready');
   if (!capture) throw new ExplicitContextError('CAPTURE_NOT_READY');
   const receiptKey = `logic-bridge:attach:${sessionId}:${projectId}:${captureId}`;
+  const journalKey = `logic-bridge:attach-operation:${sessionId}:${projectId}:${captureId}`;
   const receipt = await get<unknown>(receiptKey);
-  if (typeof receipt === 'string' && useProjectStore.getState().getClipById(receipt)) {
+  const journal = typeof receipt === 'string' ? undefined : await get<{ started: true; inventory: string } | { track: NonNullable<ReturnType<typeof useProjectStore.getState>['project']>['tracks'][number]; completed: boolean }>(journalKey);
+  const inMemory = referenceImports.get(receiptKey);
+  if (!inMemory && journal && 'started' in journal) {
+    const current = useProjectStore.getState().project;
+    if (!current || current.id !== projectId || referenceInventory(current) !== journal.inventory) throw new ExplicitContextError('Reference import was interrupted before ownership was recorded. Inspect the project and remove the incomplete reference and its empty track, or use a different project.');
+    await del(journalKey);
+  }
+  const owned = inMemory ?? (journal && 'track' in journal ? journal : undefined);
+  boundConnection(sessionId, projectId);
+  const currentTrack = owned && useProjectStore.getState().project?.tracks.find(track => track.id === owned.track.id);
+  if (owned && !currentTrack && !owned.completed && !owned.track.clips.some(clip => useProjectStore.getState().getClipById(clip.id))) {
+    referenceImports.delete(receiptKey);
+    await del(journalKey);
+  } else if (owned && (!currentTrack || referenceTrackSnapshot(currentTrack) !== referenceTrackSnapshot(owned.track))) {
+    throw new ExplicitContextError('Reference import was changed; resolve it before retrying.');
+  }
+  if (owned && !owned.completed) {
+    if (currentTrack) useProjectStore.getState().removeTrack(owned.track.id);
+    referenceImports.delete(receiptKey);
+    await del(journalKey);
+    boundConnection(sessionId, projectId);
+  }
+  const savedClipId = typeof receipt === 'string' ? receipt : owned?.completed ? owned.track.clips[0]?.id : undefined;
+  if (savedClipId && useProjectStore.getState().getClipById(savedClipId)) {
     applyLogicReferenceTiming(capture, projectId);
-    const binding = await bridgeJson(token, '/bindings', { sessionId, projectId, captureId, clientRequestId, clipId: receipt });
+    await flushProjectReferencePersistence(projectId);
+    boundConnection(sessionId, projectId);
+    await set(receiptKey, savedClipId);
+    referenceImports.delete(receiptKey);
+    await del(journalKey);
+    boundConnection(sessionId, projectId);
+    const binding = await bridgeJson(token, '/bindings', { sessionId, projectId, captureId, clientRequestId, clipId: savedClipId });
     useLogicBridgeStore.setState({ selectedCaptureId: captureId });
     await refreshBridge();
     return binding;
@@ -126,8 +167,26 @@ async function attachCapture(request: BridgeObject): Promise<BridgeObject> {
     const secondsPerMeasure = 60 / timedProject.bpm * timedProject.timeSignature * 4 / (timedProject.timeSignatureDenominator ?? 4);
     useProjectStore.getState().updateProject({ measures: Math.ceil(duration / secondsPerMeasure) });
   }
-  const imported = await importAudioFile(new File([blob], `${stringField(capture, 'label') || 'Logic reference'}.wav`, { type: 'audio/wav' }), 0, { preserveSource: true });
+  const beforeImport = useProjectStore.getState().project;
+  if (!beforeImport || beforeImport.id !== projectId) throw new ExplicitContextError('STALE_BINDING');
+  await set(journalKey, { started: true, inventory: referenceInventory(beforeImport) });
+  boundConnection(sessionId, projectId);
+  const imported = await importAudioFile(new File([blob], `${stringField(capture, 'label') || 'Logic reference'}.wav`, { type: 'audio/wav' }), 0, { preserveSource: true, onCreated: async ({ trackId }) => {
+    const track = useProjectStore.getState().project?.tracks.find(item => item.id === trackId);
+    if (!track) throw new ExplicitContextError('Reference track was removed.');
+    const operation = { track, completed: false };
+    referenceImports.set(receiptKey, operation);
+    await set(journalKey, operation);
+  } });
+  const importedTrack = useProjectStore.getState().project?.tracks.find(track => track.id === imported.trackId);
+  if (!importedTrack) throw new ExplicitContextError('Reference track was removed.');
+  referenceImports.set(receiptKey, { track: importedTrack, completed: true });
+  await set(journalKey, { track: importedTrack, completed: true });
+  await flushProjectReferencePersistence(projectId);
+  boundConnection(sessionId, projectId);
   await set(receiptKey, imported.clipId);
+  referenceImports.delete(receiptKey);
+  await del(journalKey);
   boundConnection(sessionId, projectId);
   const binding = await bridgeJson(token, '/bindings', { sessionId, projectId, captureId, clientRequestId, clipId: imported.clipId });
   useLogicBridgeStore.setState({ selectedCaptureId: captureId });

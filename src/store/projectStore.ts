@@ -10801,3 +10801,12 @@ useProjectStore.subscribe((state) => {
     });
   }, PROJECT_LIBRARY_AUTOSAVE_DEBOUNCE_MS);
 });
+
+/** Persist the current reference-bearing project before acknowledging its preparation. */
+export async function flushProjectReferencePersistence(projectId: string): Promise<void> {
+  const project = useProjectStore.getState().project;
+  if (!project || project.id !== projectId) throw new Error('Project changed during reference persistence');
+  flushPendingProjectPersistWrite();
+  await saveProjectToIDB(_getProjectForPersist(project));
+  if (useProjectStore.getState().project !== project) throw new Error('Project changed during reference persistence');
+}

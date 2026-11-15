@@ -11,6 +11,12 @@ type AudioImportResult = {
   readonly audioKey: string;
 };
 
+export type AudioImportOwnership = {
+  readonly projectId: string;
+  readonly trackId: string;
+  readonly clipId: string;
+};
+
 class AudioImportError extends Error {
   override readonly name = 'AudioImportError';
 }
@@ -18,7 +24,7 @@ class AudioImportError extends Error {
 export async function importAudioFile(
   file: File,
   startTime = 0,
-  target?: string | { readonly trackId?: string; readonly preserveSource: boolean },
+  target?: string | { readonly trackId?: string; readonly preserveSource: boolean; readonly onCreated?: (ownership: AudioImportOwnership) => Promise<void> },
 ): Promise<AudioImportResult> {
   const trackId = typeof target === 'string' ? target : target?.trackId;
   const preserveSource = typeof target === 'object' && target.preserveSource;
@@ -64,6 +70,10 @@ export async function importAudioFile(
     lyrics: '',
   });
   if (!clip) throw new AudioImportError('Unable to create an audio clip');
+  if (typeof target === 'object' && target.onCreated) {
+    await target.onCreated({ projectId: project.id, trackId: targetTrackId, clipId: clip.id });
+    if (useProjectStore.getState().project?.id !== project.id) throw new AudioImportError('Project changed during audio import');
+  }
 
   const audioKey = await saveAudioBlob(project.id, clip.id, 'isolated', wavBlob);
   const peaks = await computeWaveformWithMipmap(audioKey, trimmedBuffer);
@@ -72,9 +82,9 @@ export async function importAudioFile(
     throw new AudioImportError('Project changed during audio import');
   }
   const targetTrack = completedProject.tracks.find((track) => track.id === targetTrackId);
-  if (!targetTrack?.clips.some((item) => item.id === clip.id)) {
-    throw new AudioImportError('Clip removed during audio import');
-  }
+  const currentClip = targetTrack?.clips.find((item) => item.id === clip.id);
+  if (!currentClip) throw new AudioImportError('Clip removed during audio import');
+  if (typeof target === 'object' && target.onCreated && currentClip !== clip) throw new AudioImportError('Clip changed during audio import');
   store.updateClipStatus(clip.id, 'ready', {
     isolatedAudioKey: audioKey,
     waveformPeaks: peaks,
