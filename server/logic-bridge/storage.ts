@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, rename, appendFile, open, unlink, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import type { BridgeCapture, BridgeCredential, BridgeJob, BridgeResult, BridgeSession, ContextBinding } from '../../shared/logic-bridge/types';
+import type { BridgeCapture, BridgeCredential, BridgeJob, BridgeResult, BridgeSession, ContextBinding, NativeRequestRecord } from '../../shared/logic-bridge/types';
 import { BridgeError } from './validation';
 import { hash } from './audio';
 export interface BridgeState {
@@ -11,6 +11,7 @@ export interface BridgeState {
   bindings: ContextBinding[];
   jobs: BridgeJob[];
   results: BridgeResult[];
+  nativeRequests: NativeRequestRecord[];
   assets: { assetId: string; sessionId: string; sha256: string; size: number }[];
 }
 export async function storage(root: string) {
@@ -32,8 +33,9 @@ export async function storage(root: string) {
     try { state = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')); }
     catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
-      state = { sessions: [], credentials: [], captures: [], bindings: [], jobs: [], results: [], assets: [] };
+      state = { sessions: [], credentials: [], captures: [], bindings: [], jobs: [], results: [], nativeRequests: [], assets: [] };
     }
+    state.nativeRequests ??= [];
     const save = async () => {
       const temporary = join(root, `${randomUUID()}.tmp`);
       await writeFile(temporary, JSON.stringify(state), { mode: 0o600 });

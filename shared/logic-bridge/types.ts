@@ -41,6 +41,44 @@ export interface ContextBinding {
   readonly clientRequestId: string;
   readonly canonicalSha256: string;
 }
+
+/** Public receipt fields never contain credential hashes or internal job request IDs. */
+interface NativeRequestBase {
+  readonly requestId: string;
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly captureId: string;
+}
+export type NativePrepareReceipt = NativeRequestBase & (
+  | { readonly kind: 'prepare'; readonly state: 'pending' | 'failed' | 'canceled'; readonly error?: string }
+  | { readonly kind: 'prepare'; readonly state: 'prepared'; readonly bindingId: string }
+);
+export type NativeGenerationReceipt = NativeRequestBase & {
+  readonly kind: 'generation';
+  readonly preparedRequestId: string;
+  readonly bindingId: string;
+  readonly instrument: string;
+  readonly prompt: string;
+} & (
+  | { readonly state: 'pending' | 'failed' | 'canceled'; readonly error?: string }
+  | { readonly state: 'submitted'; readonly jobId: string }
+);
+export type NativeRequestReceipt = NativePrepareReceipt | NativeGenerationReceipt;
+/** Server-only persisted fields; do not serialize this type into API responses. */
+type NativeRequestPrivate = {
+  readonly ownerCredentialHash: string;
+  readonly clientRequestId: string;
+  readonly payloadFingerprint: string;
+};
+export type NativeRequestRecord =
+  | (NativePrepareReceipt & NativeRequestPrivate)
+  | (NativeGenerationReceipt & NativeRequestPrivate & { readonly jobClientRequestId: string });
+export interface NativeGenerationReadiness {
+  readonly preparedRequestId: string | null;
+  readonly ready: boolean;
+  readonly reason?: string;
+  readonly instruments: readonly string[];
+}
 export type JobState = 'queued' | 'dispatched' | 'running' | 'exporting' | 'ready' | 'failed' | 'interrupted' | 'canceled';
 export interface BridgeJob {
   readonly jobId: string;

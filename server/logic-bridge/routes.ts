@@ -7,6 +7,7 @@ import { check, object, string } from './validation';
 import { appendChunk, createCapture, finalize, reservedCaptureBytes } from './captures';
 import { binding, createJob, transition, backendOccupancy, type Executor } from './jobs';
 import { hash, validateResult } from './audio';
+import { accept, owned, owner, publicReceipt, readiness, update } from './nativeRequests';
 export interface RouteRequest {
   readonly method: string;
   readonly url: URL;
@@ -108,6 +109,28 @@ export function routes(db: Awaited<ReturnType<typeof storage>>, root: string, qu
       }
       const executor = liveExecutor(sessionId); executor.seen = Date.now();
       if (id === 'jobs' && method === 'GET') return { jobs: db.state.jobs.filter(job => job.sessionId === sessionId && job.projectId === executor.projectId && (backendOccupancy(job) !== 'released' || job.state === 'canceled')) };
+      if (id === 'native-requests' && method === 'GET') return { requests: db.state.nativeRequests.filter(item => item.sessionId === sessionId && item.projectId === executor.projectId && item.state === 'pending').map(publicReceipt) };
+    }
+    if (resource === 'native-readiness' && method === 'GET' && !id) {
+      const sessionId = url.searchParams.get('sessionId') ?? ''; return readiness(db.state, sessionId, owner(credential, sessionId), executors.get(sessionId));
+    }
+    if (resource === 'native-requests') {
+      if (!id && method === 'POST') return accept(db.state, data, credential, executors.get(string(data, 'sessionId')));
+      if (!id && method === 'GET') {
+        const sessionId = url.searchParams.get('sessionId') ?? '';
+        const ownerHash = owner(credential, sessionId);
+        const clientRequestId = string({ clientRequestId: url.searchParams.get('clientRequestId') }, 'clientRequestId');
+        const record = db.state.nativeRequests.find(item => item.sessionId === sessionId && item.ownerCredentialHash === ownerHash && item.clientRequestId === clientRequestId);
+        check(record, 'NOT_FOUND', 'Request missing', 404); return publicReceipt(record);
+      }
+      if (id && method === 'GET' && !action) return publicReceipt(owned(db.state, id, credential));
+      if (id && method === 'POST' && action === 'cancel') return update(db.state, owned(db.state, id, credential), action, data);
+      if (id && method === 'POST' && action) {
+        const record = db.state.nativeRequests.find(item => item.requestId === id); check(record, 'NOT_FOUND', 'Request missing', 404);
+        check(string(data, 'sessionId') === record.sessionId, 'FORBIDDEN', 'Session mismatch', 403);
+        scope(record.sessionId, 'executor', record.projectId); const executor = liveExecutor(record.sessionId);
+        return update(db.state, record, action, data, executor);
+      }
     }
     if (resource === 'bindings') {
       const sessionId = method === 'GET' ? url.searchParams.get('sessionId') ?? '' : string(data, 'sessionId'); scope(sessionId);
