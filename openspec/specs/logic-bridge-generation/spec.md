@@ -2,7 +2,7 @@
 
 ## Purpose
 
-A paired native client requests reference preparation and generation through the live DAW executor. The ordinary job pipeline remains the sole generation pipeline.
+This specification covers a paired native client requesting reference preparation and Lego generation through the live DAW executor. Direct Cover generation follows a separate execution contract.
 
 ## Requirements
 
