@@ -2,12 +2,20 @@ import { BRIDGE_PORT, BRIDGE_PROTOCOL } from '../../shared/logic-bridge/types';
 import { ExplicitContextError } from './explicitContextGeneration';
 import { useLogicBridgeStore } from '../store/logicBridgeStore';
 
-export const BRIDGE_URL = `http://127.0.0.1:${BRIDGE_PORT}/v1`;
+export function bridgeUrlForPort(value: string | undefined): string {
+  if (value === undefined) return `http://127.0.0.1:${BRIDGE_PORT}/v1`;
+  if (!/^[0-9]+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+    throw new Error('Invalid VITE_LOGIC_BRIDGE_PORT');
+  }
+  return `http://127.0.0.1:${Number(value)}/v1`;
+}
+
+export const BRIDGE_URL = bridgeUrlForPort(import.meta.env.VITE_LOGIC_BRIDGE_PORT);
 export type BridgeObject = Record<string, unknown>;
 
 export class BridgeRequestError extends Error {
   override readonly name = 'BridgeRequestError';
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly status?: number) {
     super(message);
   }
 }
@@ -46,12 +54,12 @@ export async function bridgeRequest(token: string, path: string, body?: BridgeOb
     signal: AbortSignal.timeout(15000),
   });
   if (!response.ok) {
-    let problem = new BridgeRequestError(`BRIDGE_${response.status}`, 'Bridge request failed. Check the local bridge service and try again.');
+    let problem = new BridgeRequestError(`BRIDGE_${response.status}`, 'Bridge request failed. Check the local bridge service and try again.', response.status);
     try {
       const payload = object(await response.json());
       const error = object(payload.error);
       if (typeof error.code === 'string' && typeof error.message === 'string' && error.message.trim()) {
-        problem = new BridgeRequestError(error.code, error.message);
+        problem = new BridgeRequestError(error.code, error.message, response.status);
       }
     } catch (error) {
       if (!(error instanceof SyntaxError) && !(error instanceof ExplicitContextError)) throw error;

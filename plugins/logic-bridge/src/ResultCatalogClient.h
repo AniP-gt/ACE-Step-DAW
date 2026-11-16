@@ -15,8 +15,8 @@ public:
   std::mutex mutex;std::condition_variable cv;bool stopping=false;
   void stop() {{std::lock_guard<std::mutex> lock(mutex);stopping=true;}cv.notify_all();}
  };
- static std::optional<ResultCatalogState::Page> fetch(const ResultCatalogState::Request& request,StopControl& stop) {
-  auto url=juce::URL("http://127.0.0.1:5176/v1/results").withParameter("sessionId",request.sessionId).withParameter("limit","50");
+ static std::optional<ResultCatalogState::Page> fetch(const ResultCatalogState::Request& request,StopControl& stop,unsigned short port) {
+  auto url=juce::URL("http://127.0.0.1:"+juce::String(port)+"/v1/results").withParameter("sessionId",request.sessionId).withParameter("limit","50");
   if(!request.beforeResultId.empty()) url=url.withParameter("beforeResultId",request.beforeResultId);
   auto stream=std::make_shared<juce::WebInputStream>(url,false);
   stream->withExtraHeaders("X-Bridge-Protocol: 1\r\nAuthorization: Bearer "+juce::String(request.credential)+"\r\n").withConnectionTimeout(3000).withNumRedirectsToFollow(0);

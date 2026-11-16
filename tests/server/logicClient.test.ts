@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, spawn } from 'node:child_process';
@@ -62,6 +62,52 @@ it('pairs through the shipped CLI and uses its private credential file for authe
   vi.stubEnv('LOGIC_BRIDGE_SESSION_ID', output.sessionId);
   vi.stubEnv('LOGIC_BRIDGE_CREDENTIAL_FILE', credentialFile);
   await expect(callLogicService('logic_list_captures', { sessionId: output.sessionId })).resolves.toEqual({ captures: [] });
+});
+
+it('creates only a native pairing through the shipped CLI without a DAW project', async () => {
+  const { service, root } = await connection();
+  const { stdout } = await promisify(execFile)(process.execPath, ['--import', 'tsx', 'server/logic-pair.ts', '--native-only', 'Standalone session'], {
+    env: { ...process.env, LOGIC_BRIDGE_ROOT: root, LOGIC_BRIDGE_URL: service.url },
+  });
+  const output: unknown = JSON.parse(stdout);
+  expect(output).toEqual({ sessionId: expect.any(String), nativePairingCode: expect.any(String), expiresInSeconds: 120 });
+  if (typeof output !== 'object' || output === null || !('sessionId' in output) || !('nativePairingCode' in output)) throw new Error('Expected native pairing');
+  expect(stdout).not.toContain('"token"');
+  expect(await readdir(root)).not.toContain('clients');
+  const claim = () => fetch(`${service.url}/pairings/claim`, { method: 'POST', headers: { 'X-Bridge-Protocol': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ code: output.nativePairingCode }) });
+  const response = await claim();
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ sessionId: output.sessionId, role: 'native' });
+  expect((await claim()).status).toBe(401);
+});
+
+it('issues a native code for an existing session without creating a new session', async () => {
+  const { service, root, sessionId } = await connection();
+  const before = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')) as { sessions: unknown[] };
+  const run = (id: string) => promisify(execFile)(process.execPath, ['--import', 'tsx', 'server/logic-pair.ts', '--native-session', id], {
+    env: { ...process.env, LOGIC_BRIDGE_ROOT: root, LOGIC_BRIDGE_URL: service.url },
+  });
+  const { stdout } = await run(sessionId);
+  const output: unknown = JSON.parse(stdout);
+  expect(output).toEqual({ sessionId, nativePairingCode: expect.any(String), expiresInSeconds: 120 });
+  if (typeof output !== 'object' || output === null || !('nativePairingCode' in output)) throw new Error('Expected native pairing');
+  const response = await fetch(`${service.url}/pairings/claim`, { method: 'POST', headers: { 'X-Bridge-Protocol': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ code: output.nativePairingCode }) });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ sessionId, role: 'native' });
+  await expect(run('missing-session')).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('HTTP 404') });
+  const after = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')) as { sessions: unknown[] };
+  expect(after.sessions).toHaveLength(before.sessions.length);
+});
+
+it.each([{ extra: false }, { extra: true }])('rejects invalid native-only arguments before creating a session: extra=$extra', async ({ extra }) => {
+  const { service, root } = await connection();
+  const args = extra ? ['--native-only', 'Session', join(root, 'unexpected-credential.json')] : ['--native-only'];
+  const before = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')) as { sessions: unknown[] };
+  await expect(promisify(execFile)(process.execPath, ['--import', 'tsx', 'server/logic-pair.ts', ...args], {
+    env: { ...process.env, LOGIC_BRIDGE_ROOT: root, LOGIC_BRIDGE_URL: service.url },
+  })).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining('Usage:') });
+  const after = JSON.parse(await readFile(join(root, 'state.json'), 'utf8')) as { sessions: unknown[] };
+  expect(after.sessions).toHaveLength(before.sessions.length);
 });
 
 it('serves a real Logic MCP call without opening a browser WebSocket', async () => {

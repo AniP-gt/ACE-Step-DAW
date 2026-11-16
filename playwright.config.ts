@@ -12,6 +12,9 @@ function deriveWorktreePort() {
 }
 
 const e2ePort = Number(process.env.E2E_PORT) || 5274 + deriveWorktreePort();
+if (process.env.VITE_LOGIC_BRIDGE_PORT !== undefined) {
+  process.env.LOGIC_BRIDGE_ORIGINS = `http://127.0.0.1:${e2ePort}`;
+}
 const safeProcessEnv = createPlaywrightProxySafeEnv(process.env);
 
 applyPlaywrightProxySafeEnv(process.env);
@@ -45,6 +48,8 @@ export default defineConfig({
     env: {
       ...safeProcessEnv,
       VITE_PORT: String(e2ePort),
+      ...(process.env.VITE_LOGIC_BRIDGE_PORT !== undefined ? { VITE_LOGIC_BRIDGE_PORT: process.env.VITE_LOGIC_BRIDGE_PORT } : {}),
+      ...(process.env.VITE_LOGIC_BRIDGE_VERIFIED_MODEL !== undefined ? { VITE_LOGIC_BRIDGE_VERIFIED_MODEL: process.env.VITE_LOGIC_BRIDGE_VERIFIED_MODEL } : {}),
     },
   },
 });

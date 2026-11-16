@@ -16,6 +16,7 @@ import { useLogicBridgeStore } from '../../store/logicBridgeStore';
 import { generateFromExplicitContext } from '../generationPipeline';
 import { runBridgeJob } from '../logicBridgeExecutor';
 import { reconcileBridgeJob } from '../logicBridgeReconciliation';
+import * as audioFiles from '../audioFileManager';
 
 vi.mock('../projectStorage', () => ({ saveProject: vi.fn() }));
 vi.mock('../generationPipeline', () => ({ generateFromExplicitContext: vi.fn() }));
@@ -163,4 +164,92 @@ it.each(['before-dispatch', 'after-dispatch', 'pipeline-preflight'] as const)('r
     vi.unstubAllGlobals(); vi.clearAllMocks();
     await service.close(); await rm(root, { recursive: true, force: true });
   }
+});
+
+
+it.each(['download', 'dispatch'] as const)('blocks native inference when reference changes during %s', async phase => {
+  vi.stubGlobal('crypto', webcrypto); vi.stubGlobal('Blob', NodeBlob);
+  useProjectStore.getState().createProject();
+  useGenerationStore.setState({ isGenerating: false, backendOccupancyJobId: null });
+  useModelStore.setState({ availableModels: [{ name: 'base', is_loaded: true, is_default: false, supported_task_types: ['lego'] }] });
+  const project = useProjectStore.getState().project!;
+  const track = useProjectStore.getState().addTrack('keyboard', 'sample');
+  const clip = useProjectStore.getState().addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+  useProjectStore.getState().updateClipStatus(clip.id, 'ready', { isolatedAudioKey: 'reference', source: 'uploaded', audioDuration: 1, audioOffset: 0 });
+  const bytes = new TextEncoder().encode('canonical-source');
+  const digest = await webcrypto.subtle.digest('SHA-256', bytes);
+  const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+  vi.spyOn(audioFiles, 'loadAudioBlobByKey').mockResolvedValue(new NodeBlob([bytes]) as Blob);
+  const job = { jobId: 'job', sessionId: 'session', projectId: project.id, captureId: 'capture', bindingId: 'binding', nativePreparedRequestId: 'prepare', canonicalSha256: hash, modelId: 'base', instrument: 'bass', startFrame: 0, endFrame: 48000, seed: 0, prompt: 'Bass', state: 'queued' };
+  useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: 'fixture', sessionId: 'session', projectId: project.id, executorId: 'executor', captures: [{ captureId: 'capture', state: 'ready', canonicalAssetId: 'asset', canonicalSha256: hash, canonicalFrameCount: 48000, tempo: 120, timeSignature: [4, 4] }], bindings: [{ bindingId: 'binding', projectId: project.id, captureId: 'capture', clipId: clip.id, canonicalSha256: hash }] });
+  let jobState = 'queued'; let occupancy = 'reserved'; const actions: string[] = [];
+  vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+    if (url.includes('/assets/')) { if (phase === 'download') useProjectStore.getState().updateClip(clip.id, { duration: 0.5 }); return new Response(bytes); }
+    if (url.endsWith('/invalidate')) { actions.push('invalidate'); return new Response(JSON.stringify({ state: 'failed' })); }
+    if (url.endsWith('/transition')) {
+      const data = JSON.parse(String(init?.body)); jobState = data.state; actions.push(data.state);
+      occupancy = data.state === 'failed' && !actions.includes('dispatched') ? 'released' : 'occupied';
+      if (data.state === 'dispatched' && phase === 'dispatch') useProjectStore.getState().updateClip(clip.id, { duration: 0.5 });
+    } else if (url.endsWith('/reconcile')) { occupancy = 'released'; actions.push('reconcile'); }
+    return new Response(JSON.stringify({ ...job, state: jobState, backendOccupancy: occupancy }));
+  });
+  try {
+    await runBridgeJob(job, new AbortController().signal);
+    expect(generateFromExplicitContext).not.toHaveBeenCalled();
+    expect(actions).toContain('invalidate');
+    expect(jobState).toBe('failed'); expect(occupancy).toBe('released');
+    expect(useProjectStore.getState().project!.tracks.flatMap(item => item.clips).map(item => item.id)).toEqual([clip.id]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllGlobals(); }
+});
+
+it('invalidates a cropped native reference and releases its dispatched job over HTTP', async () => {
+  vi.stubGlobal('crypto', webcrypto); vi.stubGlobal('Blob', NodeBlob);
+  useProjectStore.getState().createProject();
+  useGenerationStore.setState({ isGenerating: false, backendOccupancyJobId: null });
+  useModelStore.setState({ availableModels: [{ name: 'base', is_loaded: true, is_default: false, supported_task_types: ['lego'] }] });
+  const project = useProjectStore.getState().project!;
+  const track = useProjectStore.getState().addTrack('keyboard', 'sample');
+  const clip = useProjectStore.getState().addClip(track.id, { startTime: 0, duration: 1, prompt: '', lyrics: '' });
+  const root = await mkdtemp(join(tmpdir(), 'native-source-http-'));
+  const service = await createBridgeService({ root, port: 0 });
+  const transport = globalThis.fetch;
+  const api = async (token: string, path: string, body?: Record<string, unknown>) => {
+    const response = await transport(`${service.url}${path}`, { headers: { Authorization: `Bearer ${token}`, 'X-Executor-Id': 'executor', 'X-Bridge-Protocol': '1', 'Content-Type': 'application/json' }, method: body ? 'POST' : 'GET', ...(body ? { body: JSON.stringify(body) } : {}) });
+    expect(response.ok).toBe(true); return object(await response.json());
+  };
+  try {
+    const session = await api(service.controlToken, '/sessions', { name: 'Native source guard' });
+    const sessionId = stringField(session, 'sessionId');
+    const pair = async (role: string) => { const item = await api(service.controlToken, '/pairings', { sessionId, role, projectId: project.id }); return stringField(await api('', '/pairings/claim', { code: item.code }), 'token'); };
+    const native = await pair('native'); const executor = await pair('executor');
+    const capture = await api(native, '/captures', { sessionId, instanceId: 'native', sampleRate: 48000, channels: 1, expectedFrames: 48000, hostStartSample: 0, tempo: 120, timeSignature: [4, 4] });
+    const pcm = Buffer.alloc(48000 * 4); pcm.writeFloatLE(0.5, 100);
+    const sha256 = createHash('sha256').update(pcm).digest('hex');
+    expect((await transport(`${service.url}/captures/${capture.captureId}/chunks/0`, { method: 'PUT', headers: { Authorization: `Bearer ${native}`, 'X-Bridge-Protocol': '1', 'X-Start-Frame': '0', 'X-Chunk-SHA256': sha256 }, body: pcm })).status).toBe(200);
+    const ready = await api(native, `/captures/${capture.captureId}/finalize`, { sha256 });
+    const canonical = await transport(`${service.url}/assets/${ready.canonicalAssetId}`, { headers: { Authorization: `Bearer ${executor}`, 'X-Bridge-Protocol': '1' } });
+    const bytes = await canonical.arrayBuffer();
+    vi.spyOn(audioFiles, 'loadAudioBlobByKey').mockResolvedValue(new NodeBlob([bytes]) as Blob);
+    useProjectStore.getState().updateClipStatus(clip.id, 'ready', { isolatedAudioKey: 'reference', source: 'uploaded', audioDuration: 1, audioOffset: 0 });
+    await api(executor, '/executor/register', { sessionId, projectId: project.id, executorId: 'executor', modelId: 'base', instruments: ['bass'], outputSemantics: 'isolated-layer' });
+    const prepare = await api(native, '/native-requests', { sessionId, kind: 'prepare', clientRequestId: 'prepare', captureId: capture.captureId });
+    const binding = await api(executor, '/bindings', { sessionId, projectId: project.id, captureId: capture.captureId, clipId: clip.id, clientRequestId: 'binding' });
+    await api(executor, `/native-requests/${prepare.requestId}/prepared`, { sessionId, bindingId: binding.bindingId });
+    const intent = await api(native, '/native-requests', { sessionId, kind: 'generation', clientRequestId: 'intent', preparedRequestId: prepare.requestId, instrument: 'bass' });
+    const submitted = await api(executor, `/native-requests/${intent.requestId}/submit`, { sessionId });
+    const poll = await api(executor, `/executor/jobs?sessionId=${sessionId}`);
+    if (!Array.isArray(poll.jobs)) throw new Error('Missing jobs');
+    const job = object(poll.jobs[0]);
+    useLogicBridgeStore.setState({ ...useLogicBridgeStore.getInitialState(), connected: true, token: executor, sessionId, projectId: project.id, executorId: 'executor', captures: [ready], bindings: [binding] });
+    vi.stubGlobal('fetch', async (input: string, init?: RequestInit) => {
+      const response = await transport(input.replace(BRIDGE_URL, service.url), init);
+      if (input.endsWith('/transition') && init?.body === JSON.stringify({ state: 'dispatched' })) useProjectStore.getState().updateClip(clip.id, { duration: 0.5 });
+      return response;
+    });
+    await runBridgeJob(job, new AbortController().signal);
+    expect(generateFromExplicitContext).not.toHaveBeenCalled();
+    expect(await api(native, `/native-requests/${prepare.requestId}`)).toMatchObject({ state: 'failed', error: 'STALE_BINDING' });
+    expect(await api(executor, `/jobs/${submitted.jobId}`)).toMatchObject({ state: 'failed', backendOccupancy: 'released', error: 'STALE_BINDING' });
+    expect(useProjectStore.getState().project!.tracks.flatMap(item => item.clips).map(item => item.id)).toEqual([clip.id]);
+  } finally { vi.restoreAllMocks(); vi.unstubAllGlobals(); await service.close(); await rm(root, { recursive: true, force: true }); }
 });

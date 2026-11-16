@@ -5,7 +5,9 @@ import { storage } from './storage';
 import { routes } from './routes';
 import { BridgeError, check, object, string } from './validation';
 import { BRIDGE_PORT, type BridgeCredential } from '../../shared/logic-bridge/types';
-interface Options { readonly root: string; readonly port?: number; readonly origins?: readonly string[]; readonly quotaBytes?: number }
+import { createDirectCoverWorker } from './directCoverWorker';
+import type { BridgeState } from './storage';
+interface Options { readonly root: string; readonly port?: number; readonly origins?: readonly string[]; readonly quotaBytes?: number; readonly apiUrl?: string; readonly apiKey?: string }
 function matches(a: string, b: string): boolean { return a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
 async function body(request: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = []; let length = 0;
@@ -29,6 +31,13 @@ export async function createBridgeService(options: Options) {
   });
   let cursor = events.at(-1)?.cursor ?? 0;
   let tail: Promise<unknown> = Promise.resolve();
+  const transact = <T>(fn: (state: BridgeState) => Promise<T> | T): Promise<T> => {
+    const current = tail.then(async () => { const result = await fn(db.state); await db.save(); return result; });
+    tail = current.then(() => undefined, () => undefined); return current;
+  };
+  let directWorker: ReturnType<typeof createDirectCoverWorker>;
+  try { directWorker = createDirectCoverWorker({ root: options.root, quota: options.quotaBytes ?? 10 * 1024 ** 3, apiUrl: options.apiUrl ?? 'http://127.0.0.1:8001', apiKey: options.apiKey, transact }); }
+  catch (error) { sockets.close(); await db.close(); throw error; }
   let origin = '';
   const credential = (token: string): BridgeCredential | 'control' | undefined => matches(token, db.controlToken) ? 'control' : db.state.credentials.find(item => matches(token, item.token));
   const validateSurface = (request: IncomingMessage) => {
@@ -57,6 +66,7 @@ export async function createBridgeService(options: Options) {
         const result = await dispatch({ method: request.method ?? 'GET', url, credential: authenticated, bytes, headers: request.headers });
         if (mutating) {
           await db.save();
+          if (request.method === 'POST' && url.pathname === '/v1/direct-jobs') { const value = object(result); if (typeof value.requestId === 'string' && value.state === 'queued') directWorker.kick(value.requestId); }
           const resultObject = Buffer.isBuffer(result) ? {} : object(result);
           const sessionId = typeof resultObject.sessionId === 'string' ? resultObject.sessionId : authenticated && authenticated !== 'control' ? authenticated.sessionId : 'control';
           const event = { cursor: ++cursor, sessionId, type: url.pathname };
@@ -101,9 +111,11 @@ export async function createBridgeService(options: Options) {
   const address = server.address();
   check(address && typeof address !== 'string', 'LISTEN_FAILED', 'Missing listener', 500);
   origin = `http://127.0.0.1:${address.port}`;
+  for (const job of db.state.directCoverJobs) if (job.state === 'interrupted' && job.backendOccupancy === 'unknown' && job.backendTaskId) directWorker.kick(job.requestId, true);
   let closed = false;
   return { url: `${origin}/v1`, controlToken: db.controlToken, close: async () => {
     if (closed) return; closed = true;
+    await directWorker.stop();
     for (const socket of sockets.clients) socket.terminate(); sockets.close();
     server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await tail; await db.close();

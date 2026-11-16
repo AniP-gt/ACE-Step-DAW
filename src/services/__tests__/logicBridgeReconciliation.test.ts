@@ -51,4 +51,24 @@ describe('backend occupancy reconciliation', () => {
     await expect(reconcileBridgeJob({ jobId: 'offline', state: 'canceled', backendTaskId: 'backend', backendOccupancy: 'unknown' }, 'credential')).rejects.toThrow('queryResult failed');
     expect(useGenerationStore.getState().tryAcquireGenerationLock()).toBe(false);
   });
+  it('rejects an old backend response after the connection changes', async () => {
+    let release!: () => void;
+    let reached!: () => void;
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const fetch = vi.fn(async () => { reached(); await wait; return new Response(JSON.stringify({ data: [{ task_id: 'backend', status: 1 }] })); });
+    vi.stubGlobal('fetch', fetch);
+    let current = true;
+    const pending = reconcileBridgeJob({ jobId: 'old', state: 'interrupted', backendTaskId: 'backend', backendOccupancy: 'unknown' }, 'old', () => { if (!current) throw new Error('STALE_BINDING'); });
+    await entered;
+    current = false;
+    useLogicBridgeStore.setState({ error: 'new connection', jobs: [] });
+    release();
+    await expect(pending).rejects.toThrow('STALE_BINDING');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(useLogicBridgeStore.getState().error).toBe('new connection');
+    expect(useLogicBridgeStore.getState().jobs).toEqual([]);
+    expect(useGenerationStore.getState().backendOccupancyJobId).toBe('old');
+  });
+
 });

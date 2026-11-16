@@ -1,8 +1,8 @@
 # Logic Bridge Development Usage
 
-This development integration captures audio from a native AU effect and supplies an explicitly selected source to the separate DAW. Model generation requires a verified compatible Base model. Building the plugin alone does not establish Logic compatibility or musical output quality.
+This development integration captures audio from a native AU effect. The existing DAW path supplies an explicitly selected source to the DAW for Base Lego layer generation. The Direct Cover path sends the captured source through the bridge service to a separately running ACE-Step API without requiring an open DAW project. Building the plugin alone does not establish Logic compatibility or musical output quality.
 
-## Start the service and DAW
+## Start the service and DAW for the existing Lego workflow
 
 ```sh
 npm run bridge
@@ -22,6 +22,28 @@ The output contains a session ID and short-lived native/executor pairing codes. 
 For MCP/CLI service tools, set `LOGIC_BRIDGE_CREDENTIAL_FILE` to that explicit credential file in the environment launching the MCP process. Alternatively supply `LOGIC_BRIDGE_TOKEN` and `LOGIC_BRIDGE_SESSION_ID`. Do not paste tokens into prompts or checked-in configuration. The project/session binding is validated before mutation; a different open tab is never selected implicitly.
 
 The embedded Codex launcher forwards the names `LOGIC_BRIDGE_URL`, `LOGIC_BRIDGE_TOKEN`, `LOGIC_BRIDGE_SESSION_ID` and `LOGIC_BRIDGE_CREDENTIAL_FILE` to its session-local MCP configuration. Start the DAW with the intended environment before opening that terminal. Secret values are not added to command-line configuration.
+
+## Direct Cover without an open DAW
+
+Start the bridge service and an ACE-Step API separately. The bridge defaults to `http://127.0.0.1:8001` for the API; its service environment can set `LOGIC_BRIDGE_API_URL` to another HTTP loopback origin and, when needed, `ACESTEP_API_KEY`. A Cover-capable model must already be loaded. Starting the bridge does not start the API or switch models.
+
+Create a bridge session and one-use native pairing code without a DAW project:
+
+```sh
+npm run bridge:pair -- --native-only 'Logic session'
+```
+
+Enter the printed `nativePairingCode` into the AU within 120 seconds and choose **Pair**. Save the printed `sessionId` for later re-pairing; it is an identifier, not the bearer credential. The command does not create an executor pairing or MCP credential file. To issue a new native code for the same session after reopening Logic, use:
+
+```sh
+npm run bridge:pair -- --native-session '<session-id>'
+```
+
+This preserves access to that session's completed Results catalog. A new native credential cannot read another credential's private direct-job receipt; an unknown or still-running backend request may need the recovery procedure below. Creating a new session with `--native-only` gives a separate results catalog. Insert the paired AU after the software instrument or on an audio track, and capture a continuous passage. Select **Direct Cover**, type a description such as `solo violin, expressive bowing and natural vibrato`, and choose **Generate Cover**. The AU shows the source and generation state; when the resulting WAV has been downloaded and verified, drag it to a new Logic audio track at **Suggested start**. If automatic fetching fails after generation, use **Refresh**, select the result, and choose **Fetch selected**. The WAV can also be imported by file menu and copied into the Logic project as described below.
+
+The input is the instrument's rendered audio, not the MIDI notes. Cover uses that audio as its source and may change pitch, timing, duration, or arrangement. It cannot guarantee a particular instrument sound or note-for-note reproduction. The original Logic MIDI remains available. For a comparable DAW distinction, Ableton describes [recording routed audio](https://www.ableton.com/en/live-manual/12/routing-and-i-o/) and [committing a MIDI or audio track to audio](https://help.ableton.com/hc/en-us/articles/22998838817820-Committing-Audio-in-Live); this bridge captures its insert's audio output rather than reading the host's MIDI region.
+
+The service scopes request receipts to the paired native credential. The AU checks the existing request after a lost response and does not automatically submit it again. If the backend outcome is unknown, further bridge generation can remain blocked until the backend is reconciled. Stopping the GUI or losing the connection does not establish that inference stopped. See [the direct-job service contract](../../server/logic-bridge/README.md#direct-cover-jobs) for restart and operator recovery behavior.
 
 ## Capture and add a layer
 
@@ -43,7 +65,7 @@ All tools are also available through `npx tsx server/daw-cli.ts logic <tool> '<J
 
 For keyboard-based return, create a new Logic audio track, use File > Import > Audio File, and select the exported WAV shown by Reveal in Finder. Import it at the suggested position. File > Project Management > Consolidate with audio-file copying enabled makes the project independent from the bridge's export folder. Logic can append metadata to an imported WAV; the current native implementation therefore keeps its verified original separately in `~/Library/ACE-Step Bridge/native-results/verified-cache/` and hands out writable copies. Offline restoration validates the original and makes a fresh copy without overwriting earlier exported files.
 
-The AU Results list shows the paired session's ready results with instrument, duration, signed start and a shortened UUID. Select a row and choose **Fetch selected**. Selection, refresh and paging do not fetch audio or replace a previously downloaded WAV. Use **Refresh** for a new check, **Older** for the next older page and **Latest** to return to the newest page; a selected ID remains selected across navigation and can be fetched when visible again. The full UUID is available to accessibility tools. For manual lookup, open **Advanced**, enter a result UUID and choose **Fetch UUID**. The DAW Logic Bridge panel also exposes a selectable read-only `Result UUID`, and MCP `logic_export_result` is another way to obtain it.
+The AU Results list shows the paired session's ready results with instrument, duration, signed start and a shortened UUID. Select a row and choose **Fetch selected**. Catalog selection, refresh and paging do not fetch audio or replace a previously downloaded WAV. Direct Cover separately fetches its newly completed WAV automatically. Use **Refresh** for a new check, **Older** for the next older page and **Latest** to return to the newest page; a selected ID remains selected across navigation and can be fetched when visible again. The full UUID is available to accessibility tools. For manual lookup, open **Advanced**, enter a result UUID and choose **Fetch UUID**. The DAW Logic Bridge panel also exposes a selectable read-only `Result UUID`, and MCP `logic_export_result` is another way to obtain it.
 
 While the AU editor is visible and paired, it polls for results using a separate background worker. On macOS that worker uses background QoS. The first successful latest-page response is a silent baseline; a later result above the session high-water mark shows **New results available** until dismissed. It is a generic notice without a count. An unchanged result set or re-pairing to the same session does not repeat the notice; a restored AU state or a different session starts a new baseline. Background checks do not replace an older page. Failed checks retain the displayed rows, show a stale state and back off automatic retries up to 30 seconds. Pair again after reopening because credentials are not saved. Explicit-context source uploads preserve canonical WAV bytes instead of applying the ordinary upload downsampling optimization.
 

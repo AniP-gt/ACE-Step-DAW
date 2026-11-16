@@ -33,7 +33,7 @@ public:
  ResultCatalogView() : list("Results", this), refreshButton("Refresh"), olderButton("Older"), latestButton("Latest"), dismissButton("Dismiss"), fetchButton("Fetch selected") {
   for(auto* c:std::initializer_list<juce::Component*>{&heading,&state,&notice,&list,&refreshButton,&olderButton,&latestButton,&dismissButton,&fetchButton}) addAndMakeVisible(c);
   heading.setText("Results",juce::dontSendNotification);heading.setFont(juce::FontOptions(17.0f,juce::Font::bold));
-  list.setRowHeight(38);list.setWantsKeyboardFocus(true);list.setTitle("Available results");
+  list.setRowHeight(38);list.setWantsKeyboardFocus(true);list.setTitle("Available results");list.setColour(juce::ListBox::backgroundColourId,juce::Colour(0xff1a1d21));list.setColour(juce::ListBox::outlineColourId,juce::Colour(0xff4c535e));list.setOutlineThickness(1);
   refreshButton.onClick=[this]{if(refresh)refresh();};olderButton.onClick=[this]{if(older)older(page.nextBeforeResultId);};
   latestButton.onClick=[this]{if(latest)latest();};dismissButton.onClick=[this]{if(dismiss)dismiss();};
   fetchButton.onClick=[this]{if(canFetch() && fetch)fetch(selected);};
@@ -43,15 +43,14 @@ public:
   int index=-1;for(int i=0;i<getNumRows();++i)if(juce::String(page.results[static_cast<size_t>(i)].resultId)==selected){index=i;break;}
   if(index>=0)list.selectRow(index,false,false);else list.deselectAllRows();
   state.setText(!paired?"Pair to see results":stale?"Results may be stale. Retry in "+juce::String(retrySeconds)+" seconds":inFlight?"Loading results...":!baseline?"Waiting for results":page.results.empty()?"No results available":"Select a result, then Fetch",juce::dontSendNotification);
-  notice.setText(showNotice?"New results available":"",juce::dontSendNotification);dismissButton.setVisible(showNotice);
+  notice.setText(showNotice?"New results available":"",juce::dontSendNotification);if(dismissButton.isVisible()!=showNotice){dismissButton.setVisible(showNotice);resized();}
   refreshButton.setEnabled(paired);latestButton.setEnabled(paired);olderButton.setEnabled(paired && !page.nextBeforeResultId.empty());
   fetchButton.setEnabled(canFetch());
  }
  void resized() override {
-  auto b=getLocalBounds();heading.setBounds(b.removeFromTop(26));state.setBounds(b.removeFromTop(25));
-  auto n=b.removeFromTop(30);dismissButton.setBounds(n.removeFromRight(90));notice.setBounds(n);
-  auto row=b.removeFromTop(34);refreshButton.setBounds(row.removeFromLeft(100).reduced(2));olderButton.setBounds(row.removeFromLeft(90).reduced(2));latestButton.setBounds(row.removeFromLeft(90).reduced(2));
-  b.removeFromTop(6);fetchButton.setBounds(b.removeFromBottom(36).removeFromRight(140).reduced(2));b.removeFromBottom(6);list.setBounds(b);
+  auto b=getLocalBounds();auto row=b.removeFromTop(28);heading.setBounds(row.removeFromLeft(90));latestButton.setBounds(row.removeFromRight(70).reduced(2));olderButton.setBounds(row.removeFromRight(70).reduced(2));refreshButton.setBounds(row.removeFromRight(78).reduced(2));
+  state.setBounds(b.removeFromTop(20));auto n=b.removeFromTop(dismissButton.isVisible()?24:0);dismissButton.setBounds(n.removeFromRight(80));notice.setBounds(n);
+  fetchButton.setBounds(b.removeFromBottom(30).removeFromRight(140).reduced(2));b.removeFromBottom(4);list.setBounds(b);
  }
 private:
  Page page;juce::String selected;bool canUseFetch=false;juce::Label heading,state,notice;CatalogFocusList list;juce::TextButton refreshButton,olderButton,latestButton,dismissButton,fetchButton;
